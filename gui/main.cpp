@@ -44,14 +44,19 @@ static QCursor makeLargeArrowCursor()
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
+    // QSettings 默认构造依赖 org/app 名，不设会写到 "Unknown Organization" 导致读不到
+    QApplication::setOrganizationName(QStringLiteral("candyboard"));
+    QApplication::setApplicationName(QStringLiteral("gui"));
 #ifndef Q_OS_ANDROID
     QApplication::setOverrideCursor(makeLargeArrowCursor());  // 全局大光标
 #endif
-    StartScreen start;
+    // 必须堆分配：StartScreen 构造函数会把自身地址记入 s_liveMenu，
+    // 之后回主菜单时新实例会 delete 旧实例——栈对象被 delete 会直接堆崩溃
+    StartScreen *start = new StartScreen;
 #ifdef Q_OS_ANDROID
-    start.showMaximized();
+    start->showMaximized();
 #else
-    start.show();
+    start->show();
 #endif
     return app.exec();
 }

@@ -1,10 +1,33 @@
 #include "NetworkManager.h"
+#include "InternetClient.h"
 #include <QNetworkDatagram>
 #include <QRandomGenerator>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QByteArray>
 
 NetworkManager::NetworkManager(QObject *parent)
     : QObject(parent)
 {
+}
+
+void NetworkManager::attachInternet(InternetClient *ic)
+{
+    m_internet = ic;
+    m_transport = Transport::Internet;
+
+    // InternetClient 对局信号 -> 本类同名信号（信号连信号，MainWindow 无感知）
+    connect(ic, &InternetClient::moveReceived, this, &NetworkManager::moveReceived);
+    connect(ic, &InternetClient::chatReceived, this, &NetworkManager::chatReceived);
+    connect(ic, &InternetClient::avatarReceived, this, &NetworkManager::avatarReceived);
+    connect(ic, &InternetClient::versionReceived, this, &NetworkManager::versionReceived);
+    connect(ic, &InternetClient::undoRequested, this, &NetworkManager::undoRequested);
+    connect(ic, &InternetClient::undoAnswered, this, &NetworkManager::undoAnswered);
+    connect(ic, &InternetClient::restartRequested, this, &NetworkManager::restartRequested);
+    connect(ic, &InternetClient::restartAnswered, this, &NetworkManager::restartAnswered);
+    connect(ic, &InternetClient::resignReceived, this, &NetworkManager::resignReceived);
+    connect(ic, &InternetClient::badMoveReceived, this, &NetworkManager::badMoveReceived);
+    connect(ic, &InternetClient::peerDisconnected, this, &NetworkManager::disconnected);
 }
 
 NetworkManager::~NetworkManager()
@@ -13,6 +36,11 @@ NetworkManager::~NetworkManager()
         m_socket->disconnectFromHost();
         m_socket->deleteLater();
     }
+    for (QTcpSocket *spec : m_spectators) {
+        spec->disconnectFromHost();
+        spec->deleteLater();
+    }
+    m_spectators.clear();
     if (m_server) {
         m_server->close();
         m_server->deleteLater();
@@ -99,24 +127,27 @@ void NetworkManager::onNewConnection()
 {
     while (m_server->hasPendingConnections()) {
         QTcpSocket *s = m_server->nextPendingConnection();
-        // 已有对手：直接拒绝多余连接（防止对局中被第三者顶掉棋盘通道）
+        // 已有对局者：新连接是观战者
         if (m_socket) {
-            s->abort();
-            s->deleteLater();
+            m_spectators.append(s);
+            connect(s, &QTcpSocket::readyRead, this, &NetworkManager::onSpectatorReadyRead);
+            connect(s, &QTcpSocket::disconnected, this, &NetworkManager::onSpectatorDisconnected);
+            // 通知观战者身份
+            s->write("SPEC\n");
+            s->flush();
             continue;
         }
+        // 第一个连接：对局者
         m_socket = s;
         connect(m_socket, &QTcpSocket::readyRead, this, &NetworkManager::onReadyRead);
         connect(m_socket, &QTcpSocket::disconnected, this, &NetworkManager::onDisconnected);
         connect(m_socket, qOverload<QAbstractSocket::SocketError>(&QAbstractSocket::errorOccurred),
                 this, &NetworkManager::onError);
         emit connected();
+        // 停止 UDP 广播（不再对外宣告房间），但保持 TCP 监听以接受观战者
+        if (m_beaconTimer)
+            m_beaconTimer->stop();
     }
-    // 只支持一房一人：有人进房后关闭监听并停止广播
-    if (m_socket && m_server->isListening())
-        m_server->close();
-    if (m_beaconTimer)
-        m_beaconTimer->stop();
 }
 
 // ============================================================================
@@ -180,7 +211,17 @@ void NetworkManager::processBuffer()
         if (line.isEmpty())
             continue;
 
-        if (line.startsWith("MOVE ")) {
+        if (line.startsWith("SIDE ")) {
+            // 房主通知执方：SIDE R（房主红）或 SIDE B（房主黑）
+            emit sideReceived(line.mid(5).trimmed() == "R");
+        } else if (line == "SPEC") {
+            // 房主通知：本连接为观战身份
+            m_isSpectator = true;
+            emit spectatorReceived();
+        } else if (line.startsWith("MOVE ")) {
+            // 房主端：转发给观战者
+            if (m_transport == Transport::Lan && m_server && !m_spectators.isEmpty())
+                forwardToSpectators(QString::fromUtf8(line));
             QList<QByteArray> parts = line.mid(5).split(',');
             if (parts.size() == 4) {
                 bool ok = true;
@@ -200,9 +241,25 @@ void NetworkManager::processBuffer()
                     emit badMoveReceived();
             }
         } else if (line.startsWith("CHAT ")) {
+            // 房主端：转发给观战者
+            if (m_transport == Transport::Lan && m_server && !m_spectators.isEmpty())
+                forwardToSpectators(QString::fromUtf8(line));
             emit chatReceived(QString::fromUtf8(line.mid(5)));
         } else if (line.startsWith("AVTR ")) {
+            if (m_transport == Transport::Lan && m_server && !m_spectators.isEmpty())
+                forwardToSpectators(QString::fromUtf8(line));
             emit avatarReceived(QString::fromUtf8(line.mid(5)));
+        } else if (line.startsWith("PROFILE ")) {
+            // 对方名片：房主端转发给观战者（让观战双方名片都能显示）
+            if (m_transport == Transport::Lan && m_server && !m_spectators.isEmpty())
+                forwardToSpectators(QString::fromUtf8(line));
+            // base64 JSON: {"n":昵称,"t":头衔,"a":头像URL,"r":是否红方}
+            const QJsonObject po = QJsonDocument::fromJson(
+                QByteArray::fromBase64(line.mid(8))).object();
+            emit profileReceived(po.value("n").toString(),
+                                 po.value("t").toString(),
+                                 po.value("a").toString(),
+                                 po.value("r").toBool());
         } else if (line.startsWith("VER ")) {
             emit versionReceived(QString::fromUtf8(line.mid(4)));
         } else if (line == "UNDO REQ") {
@@ -217,48 +274,133 @@ void NetworkManager::processBuffer()
             emit restartAnswered(true);
         } else if (line == "AGAIN NO") {
             emit restartAnswered(false);
+        } else if (line == "RESIGN") {
+            if (m_transport == Transport::Lan && m_server && !m_spectators.isEmpty())
+                forwardToSpectators(QString::fromUtf8(line));
+            emit resignReceived();
         }
     }
 }
 
 void NetworkManager::sendMove(int x1, int y1, int x2, int y2)
 {
+    if (m_transport == Transport::Internet) {
+        m_internet->sendMove(x1, y1, x2, y2);
+        return;
+    }
     sendLine(QStringLiteral("MOVE %1,%2,%3,%4").arg(x1).arg(y1).arg(x2).arg(y2));
 }
 
 void NetworkManager::sendChat(const QString &text)
 {
+    if (m_transport == Transport::Internet) {
+        m_internet->sendChat(text);
+        return;
+    }
     sendLine(QStringLiteral("CHAT ") + text);
 }
 
 void NetworkManager::sendAvatar(const QString &key)
 {
+    if (m_transport == Transport::Internet) {
+        m_internet->sendAvatar(key);
+        return;
+    }
     sendLine(QStringLiteral("AVTR ") + key);
 }
 
 void NetworkManager::sendVersion(const QString &ver)
 {
+    if (m_transport == Transport::Internet) {
+        m_internet->sendVersion(ver);
+        return;
+    }
     sendLine(QStringLiteral("VER ") + ver);
+}
+
+void NetworkManager::sendSide(bool hostIsRed)
+{
+    sendLine(hostIsRed ? QStringLiteral("SIDE R") : QStringLiteral("SIDE B"));
+}
+
+void NetworkManager::sendProfile(const QString &name, const QString &title,
+                                 const QString &avatarUrl, bool selfRed)
+{
+    // 互联网模式对手信息由 match_ready 下发，不需要 LAN 名片
+    if (m_transport == Transport::Internet)
+        return;
+    QJsonObject p;
+    p["n"] = name;
+    p["t"] = title;
+    p["a"] = avatarUrl;
+    p["r"] = selfRed;
+    const QByteArray b64 =
+        QJsonDocument(p).toJson(QJsonDocument::Compact).toBase64();
+    sendLine(QStringLiteral("PROFILE ") + QString::fromLatin1(b64));
+}
+
+void NetworkManager::sendSpectatorJoin()
+{
+    // 观战者连接后不需要发任何特殊消息：房主端检测到 m_socket 已存在即判定为观战者
+    // 此方法保留为空，协议层面观战者不发 SPECJOIN
 }
 
 void NetworkManager::sendUndoRequest()
 {
+    if (m_transport == Transport::Internet) {
+        m_internet->sendUndoAction(QStringLiteral("req"));
+        return;
+    }
     sendLine(QStringLiteral("UNDO REQ"));
 }
 
 void NetworkManager::sendUndoAnswer(bool accepted)
 {
+    if (m_transport == Transport::Internet) {
+        m_internet->sendUndoAction(accepted ? QStringLiteral("yes") : QStringLiteral("no"));
+        return;
+    }
     sendLine(accepted ? QStringLiteral("UNDO YES") : QStringLiteral("UNDO NO"));
 }
 
 void NetworkManager::sendRestartRequest()
 {
+    if (m_transport == Transport::Internet) {
+        m_internet->sendRestartAction(QStringLiteral("req"));
+        return;
+    }
     sendLine(QStringLiteral("AGAIN REQ"));
 }
 
 void NetworkManager::sendRestartAnswer(bool accepted)
 {
+    if (m_transport == Transport::Internet) {
+        m_internet->sendRestartAction(accepted ? QStringLiteral("yes") : QStringLiteral("no"));
+        return;
+    }
     sendLine(accepted ? QStringLiteral("AGAIN YES") : QStringLiteral("AGAIN NO"));
+}
+
+void NetworkManager::sendResign()
+{
+    if (m_transport == Transport::Internet) {
+        m_internet->sendResign();
+        return;
+    }
+    sendLine(QStringLiteral("RESIGN"));
+}
+
+void NetworkManager::sendGameEnd(const QString &result)
+{
+    // 仅互联网模式需要服务器落库
+    if (m_transport == Transport::Internet)
+        m_internet->sendGameEnd(result);
+}
+
+void NetworkManager::leaveRoom()
+{
+    if (m_transport == Transport::Internet)
+        m_internet->leaveRoom();
 }
 
 void NetworkManager::sendLine(const QString &line)
@@ -267,6 +409,64 @@ void NetworkManager::sendLine(const QString &line)
         return;
     m_socket->write((line + "\n").toUtf8());
     m_socket->flush();
+    // 房主端：同时转发给所有观战者（SIDE/SPEC 等握手消息不转发）
+    if (m_transport == Transport::Lan && m_server && !m_spectators.isEmpty()
+        && !line.startsWith("SIDE ") && line != "SPEC")
+        forwardToSpectators(line);
+}
+
+void NetworkManager::forwardToSpectators(const QString &line)
+{
+    const QByteArray data = (line + "\n").toUtf8();
+    for (QTcpSocket *spec : m_spectators) {
+        if (spec->state() == QAbstractSocket::ConnectedState) {
+            spec->write(data);
+            spec->flush();
+        }
+    }
+}
+
+// 房主端：收到观战者发来的消息（仅聊天）
+void NetworkManager::onSpectatorReadyRead()
+{
+    QTcpSocket *spec = qobject_cast<QTcpSocket*>(sender());
+    if (!spec) return;
+    while (spec->canReadLine()) {
+        QByteArray line = spec->readLine().trimmed();
+        if (line.isEmpty()) continue;
+        if (line.startsWith("CHAT ")) {
+            QString text = QString::fromUtf8(line);
+            // 转发给对局者
+            if (m_socket && m_socket->state() == QAbstractSocket::ConnectedState) {
+                m_socket->write((text + "\n").toUtf8());
+                m_socket->flush();
+            }
+            // 转发给其他观战者
+            for (QTcpSocket *other : m_spectators) {
+                if (other != spec && other->state() == QAbstractSocket::ConnectedState) {
+                    other->write((text + "\n").toUtf8());
+                    other->flush();
+                }
+            }
+            // 房主本地显示
+            emit chatReceived(QStringLiteral("【观战】") + QString::fromUtf8(line.mid(5)));
+        }
+    }
+}
+
+void NetworkManager::onSpectatorDisconnected()
+{
+    QTcpSocket *spec = qobject_cast<QTcpSocket*>(sender());
+    if (!spec) return;
+    m_spectators.removeOne(spec);
+    spec->deleteLater();
+}
+
+bool NetworkManager::isConnected() const
+{
+    if (m_transport == Transport::Internet)
+        return m_internet && m_internet->isOpen();
+    return m_socket && m_socket->state() == QAbstractSocket::ConnectedState;
 }
 
 void NetworkManager::onDisconnected()

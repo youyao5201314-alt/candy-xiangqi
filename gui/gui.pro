@@ -1,4 +1,4 @@
-QT += core gui widgets multimedia network
+QT += core gui widgets multimedia network websockets
 
 CONFIG += c++17 utf8_source
 
@@ -11,14 +11,43 @@ SOURCES += \
     MainWindow.cpp \
     board.cpp \
     NetworkManager.cpp \
-    StartScreen.cpp
+    StartScreen.cpp \
+    api.cpp \
+    LoginDialog.cpp \
+    InternetClient.cpp \
+    FriendsPanel.cpp \
+    ProfileDialog.cpp \
+    ShopDialog.cpp \
+    MailDialog.cpp \
+    StickerPicker.cpp \
+    ChatDialog.cpp \
+    AchievementsDialog.cpp \
+    BagDialog.cpp \
+    ProfileViewDialog.cpp \
+    Inventory.cpp \
+    Achievements.cpp
 
 # 头文件
 HEADERS += \
     MainWindow.h \
     board.h \
     NetworkManager.h \
-    StartScreen.h
+    StartScreen.h \
+    api.h \
+    LoginDialog.h \
+    ServerConfig.h \
+    InternetClient.h \
+    FriendsPanel.h \
+    ProfileDialog.h \
+    ShopDialog.h \
+    MailDialog.h \
+    StickerPicker.h \
+    ChatDialog.h \
+    AchievementsDialog.h \
+    BagDialog.h \
+    ProfileViewDialog.h \
+    Inventory.h \
+    Achievements.h
 
 # UI文件
 FORMS += \
@@ -30,7 +59,9 @@ RESOURCES += \
     sounds.qrc \
     avatar.qrc \
     media.qrc \
-    videos.qrc
+    videos.qrc \
+    stickers.qrc \
+    startmusic.qrc
 
 # Windows exe 图标（两只猫戴耳机）
 win32:RC_FILE = app.rc

@@ -45,6 +45,7 @@ int alphaBeta(int board[10][9], int depth, int alpha, int beta, bool isMaxTurn);
 uint64_t getBoardHash(int board[10][9], bool redTurn);//当前局面Zobrist哈希
 void pushGameHash(uint64_t h);//每走完一手记录局面哈希
 void resetGameHash();//新对局清空历史
+bool isGameRepetition(uint64_t h);//检查该哈希是否已在对局历史中（长将/重复判输）
 //杀手与历史
 int scoreMove(int depth, const Move& m, int board[10][9], const Move& killer1, const Move& killer2);//给单个走法打分
 int mvvLvaScore(const Move& m, int board[10][9]);//吃子优先级(权重)
@@ -56,6 +57,17 @@ void executeMove(Move m);
 
 extern int coreBoard[10][9];//棋盘
 void initBoard();//初始化棋盘
+void initEndgame(int idx);//初始化残局（idx=0..endgameCount()-1）
+
+// ===== 残局信息（残局挑战界面/对局内步数限制用）=====
+struct EndgameInfo {
+    const char *name;   // 残局名称
+    const char *goal;   // 目标说明
+    const char *hint;   // 杀法提示
+    int moveLimit;      // 玩家步数上限（超过判负）
+};
+int endgameCount();                    //残局总数
+const EndgameInfo &endgameInfo(int idx);//第 idx 个残局的信息
 bool inBoard(int x, int y);//判断坐标是否合法在棋盘内
 bool movePiece(int sx, int sy, int tx, int ty);//移动棋子：(sx,sy)起点，(tx,ty)终 现阶段：不校验棋子行走规则！仅做移动框架，后面补规则
 const char* getChess(int c);//棋子字符转中文

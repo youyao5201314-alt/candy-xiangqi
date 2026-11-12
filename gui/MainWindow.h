@@ -25,7 +25,20 @@ class QAudioOutput;
 class QTextEdit;
 class QLineEdit;
 class QFrame;
+class QVBoxLayout;
+class QNetworkAccessManager;
 class NetworkManager;
+
+// 对局名片信息（玩家昵称/头衔/头像；人机模式 isAi=true 表示糖果AI）
+struct PlayerCardInfo {
+    QString name;
+    QString title;
+    QString avatarUrl;   // 服务器头像相对路径，空=彩色默认头像
+    int avatarSeed = 0;  // 默认头像取色种子（用账号 id）
+    bool isAi = false;
+    bool isSelf = false; // 是否本机玩家（名片名字后缀"（你）"）
+    bool valid = false;  // 局域网对手名片未到时为 false（先显示占位）
+};
 
 // 棋盘显示控件：所有 QPainter 绘制和鼠标点击都经由它转发给 MainWindow
 class BoardView : public QWidget
@@ -68,6 +81,12 @@ public:
     explicit MainWindow(GameMode mode = GameMode::SinglePlayer,
                         bool isHost = false,
                         NetworkManager *net = nullptr,
+                        bool playerRed = true,
+                        bool isSpectator = false,
+                        int endgameIdx = -1,
+                        int levelIdx = 0,
+                        const PlayerCardInfo &self = PlayerCardInfo(),
+                        const PlayerCardInfo &opponent = PlayerCardInfo(),
                         QWidget *parent = nullptr);
     ~MainWindow();
 
@@ -97,13 +116,21 @@ private slots:
     void onNetworkRestartRequest();                               // 对方请求重新开始
     void onNetworkRestartAnswer(bool accepted);                   // 对方应答重新开始
     void onNetworkBadMove();                                      // 收到非法走子（对方版本过旧？）
+    void onNetworkResign();                                        // 对方投降（我方获胜）
     void onPeerDisconnected();                                     // 对方掉线
+    void onNetworkProfile(const QString &name, const QString &title,
+                          const QString &avatarUrl, bool senderRed); // 收到对方名片
     void sendChatMessage();                                        // 发送聊天
     void sendUndoRequest();                                        // 联机：发送悔棋请求
     void sendRestartRequest();                                     // 联机：发送重新开始请求
     void summonDragon();                                           // 房主：召唤奶龙（登场动画+解锁挂机）
     void toggleAfk();          // 奶娃挂机 / 停止挂机 切换
     void onAfkFinished();      // 挂机奶娃搜索结束：替房主自动落子并发给对方
+    void useCandy();           // 点击糖果指导按钮：弹菜单选糖果并消耗
+    void goBackToMenu();       // 返回主菜单（关窗即回，联机未结束先确认）
+
+protected:
+    void closeEvent(QCloseEvent *event) override;   // 关窗：互联网对局通知服务器离开
 
 private:
     // 对面（AI）虚拟形象的状态
@@ -128,6 +155,21 @@ private:
     };
 
     BoardView *m_view = nullptr;
+    // ===== 双方玩家名片（棋盘上=黑方，棋盘下=红方） =====
+    PlayerCardInfo m_selfInfo;
+    PlayerCardInfo m_oppInfo;
+    QFrame *m_cardTop = nullptr;      // 黑方名片
+    QFrame *m_cardBottom = nullptr;   // 红方名片
+    QLabel *m_topAvatar = nullptr, *m_topName = nullptr, *m_topTitle = nullptr;
+    QLabel *m_botAvatar = nullptr, *m_botName = nullptr, *m_botTitle = nullptr;
+    QNetworkAccessManager *m_cardNam = nullptr;
+    void buildPlayerCards(QWidget *parent, QVBoxLayout *root);  // 构造时建名片
+    void applySideProfile(bool redSide, const PlayerCardInfo &info);  // 按执子方填名片
+    void fillCard(bool redSide, const PlayerCardInfo &info);          // 刷新一侧名片
+    void loadCardAvatar(QLabel *lbl, const QString &url,
+                        const QString &name, int seed);               // 异步下载/默认头像
+    static QPixmap makeDefaultAvatar(const QString &name, int seed, int size);
+    QPushButton *m_backBtn = nullptr;
     QPushButton *m_restartBtn = nullptr;
     QPushButton *m_undoBtn = nullptr;
     QPushButton *m_resignBtn = nullptr;
@@ -140,6 +182,9 @@ private:
     QMediaPlayer *m_musicPlayer = nullptr;
     QAudioOutput *m_audioOut = nullptr;
     bool m_playerRed = true;             // 玩家是否执红（先手）
+    bool m_isSpectator = false;          // 观战模式：看棋盘但不能走子
+    int m_endgameIdx = -1;               // 残局索引（-1=普通开局，0..6=残局挑战）
+    int m_endgameMoves = 0;              // 残局：玩家已走步数（超上限判负）
     // ===== 联机模式 =====
     GameMode m_mode = GameMode::SinglePlayer;
     bool m_isHost = false;               // 联机时是否房主（房主=红方先手）
@@ -147,6 +192,7 @@ private:
     NetworkManager *m_net = nullptr;
     QPushButton *m_summonBtn = nullptr;  // 房主专属：召唤奶龙（首次登场）
     QPushButton *m_afkBtn = nullptr;     // 房主专属：奶娃挂机 / 停止挂机（召唤后出现）
+    QPushButton *m_candyBtn = nullptr;   // 糖果指导按钮（消耗品，可让 AI 代走一步）
     bool m_dragonSummoned = false;       // 奶娃是否已登场
     bool m_afk = false;                  // 是否正在挂机（奶娃替房主打）
     QTextEdit *m_chatView = nullptr;     // 聊天消息显示
@@ -173,6 +219,8 @@ private:
 
     std::vector<Step> m_history;    // 对局走子历史（悔棋用）
     bool m_gameOver = false;        // 对局是否已结束（结束后锁定点击）
+    bool m_moneySettled = false;    // 本局货币是否已结算（防重复发放）
+    bool m_resultReported = false;  // 互联网终局是否已上报服务器（防重复）
     bool m_aiThinking = false;      // AI 是否正在思考
     bool m_redInCheck = false;      // 红方（玩家）正在被将军
     bool m_blackInCheck = false;    // 黑方（AI）正在被将军
@@ -180,6 +228,9 @@ private:
     void selectPiece(int row, int col);
     void clearSelection();
     void refreshHints();
+    // 残局挑战：状态栏进度 + 失败后统一询问（再试一次/返回菜单）
+    void updateEndgameStatus();
+    void endgameMaybeRetry(const QString &reason);
     // 逻辑坐标 -> 显示坐标（玩家执黑时棋盘旋转 180°）
     void displayPt(int row, int col, int &dr, int &dc) const;
     // 显示坐标 -> 逻辑坐标
@@ -204,6 +255,16 @@ private:
     void setPeerAvatar(const QString &key); // 加入者：按房主同步的状态渲染帮手条
     void performOnlineUndo(bool requesterIsMe);  // 联机悔棋通过后：双方同步回退到请求方上一步之前
     void applyOnlineRestart();                   // 联机重开：双方同步重置棋盘
+    // 货币结算（仅单机模式）：outcome 1=赢(+2000) 0=输(+500) 2=平(+1000)，返回实际发放金额
+    int settleMoney(int outcome);
+    // 胜利成就统计：按模式/残局记账并识别杀法称号，解锁时弹窗（killName 空=非将死杀法）
+    void reportWinAchievements(const QString &killName);
+    // ===== 糖果指导（消耗品）=====
+    bool candyAllowed() const;          // 当前模式是否允许用糖果（单机/局域网房客/互联网）
+    int candyCount(int idx) const;      // 糖果剩余数量
+    void refreshCandyButton();          // 刷新糖果按钮文字和可用状态
+    void startCandyMove(int idx);       // 消耗糖果并启动 AI 代走
+    void onCandyFinished();             // 糖果 AI 搜索结束：代我落子
 
     QLabel *m_avatarImg = nullptr;      // 形象图片/动图显示区
     QLabel *m_avatarMood = nullptr;     // 形象心情文字

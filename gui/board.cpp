@@ -53,8 +53,14 @@ static uint64_t hashBoard(int board[10][9], bool redTurn) {
 // ===== 置换表（Transposition Table）=====
 enum : signed char { TT_ALPHA = 0, TT_BETA = 1, TT_EXACT = 2 };
 struct TTEntry { uint64_t key = 0; int score = 0; short depth = 0; signed char flag = 0; Move best; };
-static const size_t TT_SIZE = 1 << 22;  // 400万槽位，约96MB，深度20需要更大缓存
-static TTEntry* TT = new TTEntry[TT_SIZE]();
+static const size_t TT_SIZE = 1 << 21;  // 200万槽位，约64MB（搜索最长20秒，200万足够）
+// 懒分配：首次搜索才创建并清零——主菜单/联机对局全程不占这64MB，启动也省掉一次性清零
+static TTEntry* ttPtr = nullptr;
+static inline TTEntry* ttTable() {
+    if (!ttPtr)
+        ttPtr = new TTEntry[TT_SIZE]();
+    return ttPtr;
+}
 
 // ===== 重复局面检测（长打禁着的简化实现：重复即判和）=====
 // g_gameHist：真实对局中走过的局面哈希（跨回合保留，由main.cpp维护）
@@ -125,6 +131,103 @@ void initBoard() {
         coreBoard
             [6][0] = 'S'; coreBoard[6][2] = 'S'; coreBoard[6][4] = 'S'; coreBoard[6][6] = 'S'; coreBoard[6][8] = 'S';
     };
+}
+
+// ===== 残局定义 =====
+// 每个残局：玩家执红先行，须在 moveLimit 步内将杀黑方（超步判负）
+// 全部残局均经引擎自战验证：红方（引擎）可在黑方（3秒/步引擎）防守下取胜
+static const EndgameInfo kEndgames[] = {
+    { "马后炮",   "在 3 步内将杀黑将",
+      "马跳到九宫士角，成\"马后炮\"：马控住将门，炮隔马轰将，老将无处可逃", 3 },
+    { "单车破双士", "在 12 步内用单车攻破双士",
+      "车逼黑士离位再逐个摘除，注意帅与车的配合封锁老将", 12 },
+    { "双车错",   "在 20 步内用双车将杀黑将",
+      "双车轮番\"错\"开叫将：一车拴住黑士，另一车沉底将军，黑士顾此失彼", 20 },
+    { "双炮轰士", "在 15 步内用双炮攻破双士",
+      "一炮作架一炮轰将（重炮），先运炮到位再逐步成杀", 15 },
+    { "马炮胜双士", "在 24 步内用马炮攻破双士",
+      "马控制将门、炮遥控宫心，先破士再成杀，注意马炮配合", 24 },
+    { "车马擒王", "在 10 步内用车马将杀光杆老将",
+      "车控制老将的活动线，马贴身叫将，车马联杀", 10 },
+    { "车炮破士象", "在 20 步内用车炮攻破士象全",
+      "炮牵制中路，车沉底线扫士，逐步瓦解黑方防线", 20 },
+};
+
+int endgameCount() {
+    return static_cast<int>(sizeof(kEndgames) / sizeof(kEndgames[0]));
+}
+
+const EndgameInfo &endgameInfo(int idx) {
+    if (idx < 0) idx = 0;
+    if (idx >= endgameCount()) idx = endgameCount() - 1;
+    return kEndgames[idx];
+}
+
+//残局初始化：7个经典实用残局，玩家执红先行，全部合法且经引擎验证红可胜
+void initEndgame(int idx) {
+    for (int i = 0; i < 10; i++)
+        for (int j = 0; j < 9; j++)
+            coreBoard[i][j] = 0;
+    switch (idx) {
+    case 0:
+        // 马后炮（入门一步杀）：马跳[2][4]九宫中心，炮[4][4]隔马轰将
+        // 黑将吃马则与红帅对脸（非法），平移将门被马控制 —— 绝杀
+        coreBoard[9][4] = 'K';
+        coreBoard[4][4] = 'P';
+        coreBoard[3][2] = 'N';
+        coreBoard[0][4] = 'k';
+        break;
+    case 1:
+        // 单车破双士：帅在3路（避将帅对脸），车逐步摘士困毙擒将（引擎验证可胜）
+        coreBoard[9][3] = 'K';
+        coreBoard[5][3] = 'R';
+        coreBoard[0][4] = 'k';
+        coreBoard[0][3] = 'a'; coreBoard[0][5] = 'a';
+        break;
+    case 2:
+        // 双车错：红双车 vs 黑将+双士（双车交替将军的经典杀型）
+        coreBoard[9][0] = 'K';
+        coreBoard[4][3] = 'R';
+        coreBoard[6][5] = 'R';
+        coreBoard[0][4] = 'k';
+        coreBoard[0][3] = 'a'; coreBoard[0][5] = 'a';
+        break;
+    case 3:
+        // 双炮轰士：双炮 vs 散位双士（士在底线+宫角），需运炮架炮成杀（引擎验证可胜）
+        coreBoard[9][4] = 'K';
+        coreBoard[8][4] = 'P';
+        coreBoard[6][6] = 'P';
+        coreBoard[0][4] = 'k';
+        coreBoard[0][3] = 'a'; coreBoard[2][5] = 'a';
+        break;
+    case 4:
+        // 马炮胜双士：马在远处需先运马（引擎验证可胜）
+        coreBoard[9][3] = 'K';
+        coreBoard[7][2] = 'N';
+        coreBoard[3][4] = 'P';
+        coreBoard[0][4] = 'k';
+        coreBoard[0][3] = 'a'; coreBoard[0][5] = 'a';
+        break;
+    case 5:
+        // 车马擒王：车马 vs 光杆老将（车控线马贴身，联杀）
+        coreBoard[9][3] = 'K';
+        coreBoard[5][3] = 'R';
+        coreBoard[5][5] = 'N';
+        coreBoard[0][4] = 'k';
+        break;
+    case 6:
+        // 车炮破士象：车炮 vs 黑将+双士+双象（高阶残局）
+        coreBoard[9][3] = 'K';
+        coreBoard[5][2] = 'R';
+        coreBoard[7][2] = 'P';
+        coreBoard[0][4] = 'k';
+        coreBoard[0][3] = 'a'; coreBoard[0][5] = 'a';
+        coreBoard[4][4] = 'b'; coreBoard[2][6] = 'b';
+        break;
+    default:
+        initBoard();
+        break;
+    }
 }
 //是否在棋盘
 bool inBoard(int x, int y) {
@@ -973,8 +1076,8 @@ static int negamax(int board[10][9], int depth, int alpha, int beta, bool redTur
     HistGuard hg(hash);
 
     int origAlpha = alpha;
-    // --- 置换表探测 ---
-    TTEntry& e = TT[hash & (TT_SIZE - 1)];
+    // --- 置换表探测（表在首次进入搜索时才分配）---
+    TTEntry& e = ttTable()[hash & (TT_SIZE - 1)];
     Move hashMove(-1, -1, -1, -1);
     if (e.key == hash)
     {
@@ -1324,6 +1427,12 @@ getKillTypeName(int board[10][9], bool loserIsRed)
 uint64_t getBoardHash(int board[10][9], bool redTurn) { return hashBoard(board, redTurn); }
 void pushGameHash(uint64_t h) { if (g_gameHistLen < 255) g_gameHist[g_gameHistLen++] = h; }
 void resetGameHash() { g_gameHistLen = 0; }
+// 检查给定哈希是否已在对局历史中出现过（长将/重复局面检测）
+bool isGameRepetition(uint64_t h) {
+    for (int i = 0; i < g_gameHistLen; i++)
+        if (g_gameHist[i] == h) return true;
+    return false;
+}
 
 //最优ai入口：迭代加深 + 期望窗口 + 根部PVS，受 TIME_LIMIT_MS 时间控制
 // 每完成一层就更新一次最优解，时间随时可中断且必有结果
