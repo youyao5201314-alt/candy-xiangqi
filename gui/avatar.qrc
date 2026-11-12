@@ -1,0 +1,14 @@
+<RCC>
+    <qresource prefix="/">
+        <file>avatar/idle.jpg</file>
+        <file>avatar/thinking.jpg</file>
+        <file>avatar/angry.jpg</file>
+        <file>avatar/lose.jpg</file>
+        <file>avatar/win.jpg</file>
+        <file>avatar/selected.jpg</file>
+        <file>avatar/action.gif</file>
+        <file>avatar/good.jpg</file>
+        <file>avatar/undo.jpg</file>
+        <file>avatar/music.jpg</file>
+    </qresource>
+</RCC>

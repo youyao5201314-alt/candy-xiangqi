@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include<iostream>
 #include<cstring>
 #include<cstdlib>
@@ -10,6 +10,8 @@
 #include <string>
 #include<random>
 using namespace std;
+extern const int MAX_DEPTH;
+
 //博弈树相关
 
 struct Move {
@@ -24,10 +26,12 @@ struct Move {
 vector<Move> generateAllMoves(int board[10][9], bool isMaxTurn);//生成全部合法走法（isMaxTurn=true=红方走，false=黑方走）
 
 Move getAIMove(int board[10][9], int searchDepth, bool isMaxTurn);//电脑AI调用入口，返回最优一步Move
+void setAiTimeLimitMs(int ms);//设置AI每步思考时间上限（毫秒），难度选项用
 
 int evaluate(int board[10][9]);//局面估值（正值=红方优势）
 
 bool simulateMove(int board[10][9], int sx, int sy, int tx, int ty);//在传入的棋盘副本上模拟走子
+
 
 
 
@@ -47,10 +51,11 @@ int mvvLvaScore(const Move& m, int board[10][9]);//吃子优先级(权重)
 void sortMoves(int depth, int board[10][9], vector<Move>& moves);//对move列表按分数降序排序
 void resetKillerAndHistory();//新对局清空杀手表
 int getPieceValue(int p);//权重参考
+void executeMove(Move m);
+
 
 extern int coreBoard[10][9];//棋盘
 void initBoard();//初始化棋盘
-void printBoard();//控制台打印棋盘
 bool inBoard(int x, int y);//判断坐标是否合法在棋盘内
 bool movePiece(int sx, int sy, int tx, int ty);//移动棋子：(sx,sy)起点，(tx,ty)终 现阶段：不校验棋子行走规则！仅做移动框架，后面补规则
 const char* getChess(int c);//棋子字符转中文

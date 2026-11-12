@@ -1,0 +1,13 @@
+<RCC>
+    <qresource prefix="/">
+        <file>sounds/select.wav</file>
+        <file>sounds/move.wav</file>
+        <file>sounds/capture.wav</file>
+        <file>sounds/check.wav</file>
+        <file>sounds/win.wav</file>
+        <file>sounds/lose.wav</file>
+        <file>sounds/capture_red.wav</file>
+        <file>sounds/check_red.wav</file>
+        <file>sounds/lose_red.wav</file>
+    </qresource>
+</RCC>

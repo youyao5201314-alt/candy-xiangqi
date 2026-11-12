@@ -1,25 +1,31 @@
-欢迎下载糖果象棋1.1版本
+欢迎下载糖果象棋2.1版本！
+本次更新了：可爱的奶娃还有奶娃音效，奶娃形象，棋盘界面（终于不再是控制台输出了），还有自定义难度，背景音乐图片什么的。最重要的一点是可以悔棋
+                   和投降了，不得不说真是一次伟大的进步。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。。         
 让我来告诉你怎么玩：
-在readme.txt同一层文件夹点击board->chess.exe就可以游玩啦
-怎么移动棋子呢？输入棋子的起始坐标就可以啦，比如要把坐标（5，5）的棋子移动到（5，6），你可以输入5 5 6 6  数字之间用空格隔开哦
+点击安装包然后安装就可以玩了
 因为是第一次制作，有不完善的地方请多多包涵~
-后续还会推出糖果象棋2.1版本和3.1版本，请关注我哦~
+后续还会推出糖果象棋3.1版本，请关注我哦~
 手机：19236515200 邮箱2218098807@qq.com 抖音78191493810
 
-Welcome to download Candy Chinese Chess v1.1
 
-Here is how to play:
-Go to the same folder as readme.txt, open the path `x64 -> Release`, and double-click `board.exe` to start the game.
+# Candy‑Chess Version 2.1 Release Notes
 
-How to move pieces:
-Simply enter the starting and target coordinates of your chess piece.
-For example, if you want to move the piece at coordinate (5,5) to (5,6), input `5 5 5 6`. Separate each number with spaces.
+Welcome to download Candy‑Chess Version 2.1!
 
-This is my first self-made program. Please excuse any imperfections.
+## Update Log
 
-Candy Chinese Chess v2.2 and v3.3 will be released later. Stay tuned!
+This update features the cute Milk‑Baby character with dedicated sound effects and visuals, plus a brand‑new chess‑board interface — no more console‑only output!
+Other new additions include adjustable difficulty settings, background music and custom image support. Most importantly, you can now undo moves and surrender games. Truly a massive leap forward for this project......
 
+## How to Play
+
+Simply open the installer and follow the setup steps to start playing.
+
+This is my very first self‑developed project, so please bear with any imperfections.
+
+Stay tuned for the upcoming Candy‑Chess Version 3.1! Follow me for future updates.
+
+Contact Info
 Mobile: 19236515200
 Email: 2218098807@qq.com
-Douyin: 78191493810
-
+Douyin ID: 78191493810

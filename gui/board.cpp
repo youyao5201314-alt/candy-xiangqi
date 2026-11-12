@@ -1,4 +1,5 @@
-﻿#include"board.h"
+#include"board.h"
+#include<algorithm>
 #include<chrono>
 //初始化棋盘函数
 int coreBoard[10][9];
@@ -8,7 +9,8 @@ const int BOARD_H = 10;
 // ===== 性能优化全局 =====
 const int INF = 1000000;    // 无穷大（避免 INT_MIN 取负溢出）
 const int MATE = 100000;    // 杀棋分值
-const int TIME_LIMIT_MS = 10000; // AI每步思考时间上限
+static int g_timeLimitMs = 20000; // AI每步思考时间上限（可由界面难度选项调整）
+void setAiTimeLimitMs(int ms) { if (ms >= 100) g_timeLimitMs = ms; }
 const int QS_MAX = 16;      // 静止搜索最大延展层数（吃子链/将军链搜到底的保险）
 static unsigned long long g_nodes = 0;  // 搜索节点计数
 static bool g_stop = false;             // 时间到标志
@@ -124,55 +126,6 @@ void initBoard() {
             [6][0] = 'S'; coreBoard[6][2] = 'S'; coreBoard[6][4] = 'S'; coreBoard[6][6] = 'S'; coreBoard[6][8] = 'S';
     };
 }
-
-//打印棋盘函数
-void printBoard() {
-    //7 = 默认白色
-
-    cout
-        << "    0   1   2   3   4   5   6   7   8 " << endl;
-    for (int i = 0; i < 10; i++)
-    {
-        cout
-            << i << "  ";
-        for (int j = 0; j < 9; j++)
-        {
-            int ch = coreBoard[i][j];
-            if (ch == 0)
-            {
-               
-                cout
-                    << "＿";
-            }
-            else if (isupper(ch))
-            {
-                //12 红色：红方棋子
-         
-                cout
-                    << getChess(ch);
-            }
-            else
-            {
-                //9 蓝色：黑方棋子
-       
-                cout
-                    << getChess(ch);
-            }
-           ;
-            if (j != 8) cout << "｜";
-        }
-        cout
-            << endl;
-        if (i != 9)
-        {
-            cout
-            << "   ——————————————————————————————————" << endl;
-        }
-    }
-    cout
-        << "\n【红色=红方｜蓝色=黑方】\n";
-}
-
 //是否在棋盘
 bool inBoard(int x, int y) {
     return x >= 0 && x <= 9 && y >= 0 && y <= 8;
@@ -508,6 +461,119 @@ bool simulateMove(int board[10][9], int sx, int sy, int tx, int ty)
     return true;
 }
 
+// ===== 候选落点生成：按棋子类型只枚举“几何上可能”的格子 =====
+// 旧版对每个棋子扫 90 个目标格再调 isValid*，绝大多数调用第一行就被否决；
+// 这里直接枚举候选点（马8点/象4点/车炮射线…），写入调用方的栈上数组（最多17个：
+// 车/炮单方向射线之和），全程零堆分配；生成后仍用 isValid* 权威校验
+// + make/isInCheck/unmake 过滤自将，合法走法集合与旧版完全一致，速度快数倍。
+static inline int genCandidates(int board[10][9], int i, int j, int c,
+                                bool capturesOnly, Move* out)
+{
+    int n = 0;
+    const bool red = isupper(c) != 0;
+    auto add = [&](int tx, int ty) {
+        if (tx < 0 || tx > 9 || ty < 0 || ty > 8) return;
+        int t = board[tx][ty];
+        if (t != 0 && (isupper(t) != 0) == red) return;  // 不能吃己方
+        if (capturesOnly && t == 0) return;              // 静止搜索只要吃子
+        out[n++] = Move(i, j, tx, ty);
+    };
+    switch (tolower(c))
+    {
+    case 'n': { // 马：8 个日字点
+        static const int d[8][2] = { {-2,-1},{-2,1},{-1,-2},{-1,2},{1,-2},{1,2},{2,-1},{2,1} };
+        for (auto& o : d) add(i + o[0], j + o[1]);
+        break;
+    }
+    case 'b': { // 象/相：4 个田字点
+        static const int d[4][2] = { {-2,-2},{-2,2},{2,-2},{2,2} };
+        for (auto& o : d) add(i + o[0], j + o[1]);
+        break;
+    }
+    case 'a': { // 士：九宫内斜走一格
+        static const int d[4][2] = { {-1,-1},{-1,1},{1,-1},{1,1} };
+        for (auto& o : d) add(i + o[0], j + o[1]);
+        break;
+    }
+    case 'k': { // 将/帅：九宫内直走一格
+        static const int d[4][2] = { {-1,0},{1,0},{0,-1},{0,1} };
+        for (auto& o : d) add(i + o[0], j + o[1]);
+        break;
+    }
+    case 's': { // 兵/卒：向前一步；过河后可横走
+        if (red) {
+            add(i - 1, j);
+            if (i <= 4) { add(i, j - 1); add(i, j + 1); }
+        } else {
+            add(i + 1, j);
+            if (i >= 5) { add(i, j - 1); add(i, j + 1); }
+        }
+        break;
+    }
+    case 'r': { // 车：4 条射线，遇子即止（敌子可吃）
+        static const int d[4][2] = { {1,0},{-1,0},{0,1},{0,-1} };
+        for (auto& o : d) {
+            int x = i + o[0], y = j + o[1];
+            while (x >= 0 && x <= 9 && y >= 0 && y <= 8) {
+                int t = board[x][y];
+                if (t == 0) { if (!capturesOnly) out[n++] = Move(i, j, x, y); }
+                else { if ((isupper(t) != 0) != red) out[n++] = Move(i, j, x, y); break; }
+                x += o[0]; y += o[1];
+            }
+        }
+        break;
+    }
+    case 'p': { // 炮：炮架前走空位，炮架后吃第一颗敌子
+        static const int d[4][2] = { {1,0},{-1,0},{0,1},{0,-1} };
+        for (auto& o : d) {
+            int x = i + o[0], y = j + o[1];
+            bool jumped = false;
+            while (x >= 0 && x <= 9 && y >= 0 && y <= 8) {
+                int t = board[x][y];
+                if (!jumped) {
+                    if (t == 0) { if (!capturesOnly) out[n++] = Move(i, j, x, y); }
+                    else jumped = true;  // 翻炮架
+                } else if (t != 0) {
+                    if ((isupper(t) != 0) != red) out[n++] = Move(i, j, x, y);
+                    break;
+                }
+                x += o[0]; y += o[1];
+            }
+        }
+        break;
+    }
+    }
+    return n;
+}
+
+// 候选走法 -> 合法走法：isValid* 校验 + 落子后不自将，结果追加到 res
+static void filterLegal(int board[10][9], bool isMaxTurn,
+                        const Move* cand, int n, vector<Move>& res)
+{
+    for (int k = 0; k < n; k++)
+    {
+        const Move& m = cand[k];
+        int c = board[m.x1][m.y1];
+        bool pseudo = false;
+        switch (c)
+        {
+        case 'N': case 'n': pseudo = isValidHorse(board, m.x1, m.y1, m.x2, m.y2); break;
+        case 'R': case 'r': pseudo = isValidRook(board, m.x1, m.y1, m.x2, m.y2); break;
+        case 'P': case 'p': pseudo = isValidCannon(board, m.x1, m.y1, m.x2, m.y2); break;
+        case 'B': case 'b': pseudo = isValidElephant(board, m.x1, m.y1, m.x2, m.y2); break;
+        case 'A': case 'a': pseudo = isValidGuard(board, m.x1, m.y1, m.x2, m.y2); break;
+        case 'K': case 'k': pseudo = isValidKing(board, m.x1, m.y1, m.x2, m.y2); break;
+        case 'S': case 's': pseudo = isValidPawn(board, m.x1, m.y1, m.x2, m.y2); break;
+        }
+        if (!pseudo) continue;
+        Undo u;
+        makeMove(board, m, u);
+        bool selfCheck = isInCheck(board, isMaxTurn);
+        unmakeMove(board, m, u);
+        if (!selfCheck) res.push_back(m);
+    }
+}
+
 //生成全部合法走法（isMaxTurn=true=红方，false=黑方）
 // 性能：伪合法判定后直接原地落子检测自将再撤销，全程零 memcpy
 vector
@@ -516,6 +582,7 @@ vector
     vector
         <Move> res;
     res.reserve(64);
+    Move cand[20];  // 单棋子候选上限17（车/炮），20 留余量
     for (int i = 0; i < 10; i++)
     {
         for (int j = 0; j < 9; j++)
@@ -525,36 +592,8 @@ vector
             // 约定：isMaxTurn=true 走红方(大写)，false 走黑方(小写)
             bool belongMax = isupper(c);
             if (belongMax != isMaxTurn) continue;
-            for (int ni = 0; ni < 10; ni++)
-            {
-                for (int nj = 0; nj < 9; nj++)
-                {
-                    int target = board[ni][nj];
-                    // 不能吃己方棋子
-                    if (target != 0 && isupper(c) == isupper(target)) continue;
-                    // 先用纯规则函数在当前棋盘上判定（不拷贝，绝大多数候选在此被过滤）
-                    bool pseudo = false;
-                    switch (c)
-                    {
-                    case 'N': case 'n': pseudo = isValidHorse(board, i, j, ni, nj); break;
-                    case 'R': case 'r': pseudo = isValidRook(board, i, j, ni, nj); break;
-                    case 'P': case 'p': pseudo = isValidCannon(board, i, j, ni, nj); break;
-                    case 'B': case 'b': pseudo = isValidElephant(board, i, j, ni, nj); break;
-                    case 'A': case 'a': pseudo = isValidGuard(board, i, j, ni, nj); break;
-                    case 'K': case 'k': pseudo = isValidKing(board, i, j, ni, nj); break;
-                    case 'S': case 's': pseudo = isValidPawn(board, i, j, ni, nj); break;
-                    }
-                    if (!pseudo) continue;
-                    // 伪合法走法：原地落子后检查己方是否仍被将军（含将帅对脸），被将军则丢弃
-                    Undo u; Move m{ i,j,ni,nj };
-                    makeMove(board, m, u);
-                    bool selfCheck = isInCheck(board, isMaxTurn);
-                    unmakeMove(board, m, u);
-                    if (selfCheck) continue;
-                    res
-                        .push_back(m);
-                }
-            }
+            int n = genCandidates(board, i, j, c, false, cand);
+            filterLegal(board, isMaxTurn, cand, n, res);
         }
     }
     return res;
@@ -565,6 +604,7 @@ static vector<Move> generateCaptures(int board[10][9], bool isMaxTurn)
 {
     vector<Move> res;
     res.reserve(16);
+    Move cand[20];
     for (int i = 0; i < 10; i++)
     {
         for (int j = 0; j < 9; j++)
@@ -572,32 +612,8 @@ static vector<Move> generateCaptures(int board[10][9], bool isMaxTurn)
             int c = board[i][j];
             if (c == 0) continue;
             if ((isupper(c) != 0) != isMaxTurn) continue;
-            for (int ni = 0; ni < 10; ni++)
-            {
-                for (int nj = 0; nj < 9; nj++)
-                {
-                    int target = board[ni][nj];
-                    if (target == 0 || (isupper(c) != 0) == (isupper(target) != 0)) continue; // 只要吃子
-                    bool pseudo = false;
-                    switch (c)
-                    {
-                    case 'N': case 'n': pseudo = isValidHorse(board, i, j, ni, nj); break;
-                    case 'R': case 'r': pseudo = isValidRook(board, i, j, ni, nj); break;
-                    case 'P': case 'p': pseudo = isValidCannon(board, i, j, ni, nj); break;
-                    case 'B': case 'b': pseudo = isValidElephant(board, i, j, ni, nj); break;
-                    case 'A': case 'a': pseudo = isValidGuard(board, i, j, ni, nj); break;
-                    case 'K': case 'k': pseudo = isValidKing(board, i, j, ni, nj); break;
-                    case 'S': case 's': pseudo = isValidPawn(board, i, j, ni, nj); break;
-                    }
-                    if (!pseudo) continue;
-                    Undo u; Move m{ i,j,ni,nj };
-                    makeMove(board, m, u);
-                    bool selfCheck = isInCheck(board, isMaxTurn);
-                    unmakeMove(board, m, u);
-                    if (selfCheck) continue;
-                    res.push_back(m);
-                }
-            }
+            int n = genCandidates(board, i, j, c, true, cand);
+            filterLegal(board, isMaxTurn, cand, n, res);
         }
     }
     return res;
@@ -1316,7 +1332,7 @@ getAIMove(int board[10][9], int searchDepth, bool isMaxTurn)
 {
     resetKillerAndHistory(); //每一次搜索清空杀手历史表！
     g_nodes = 0; g_stop = false;
-    g_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(TIME_LIMIT_MS);
+    g_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(g_timeLimitMs);
     auto t0 = std::chrono::steady_clock::now();
     // 把真实对局历史装进搜索路径（重复局面检测用）
     for (int i = 0; i < g_gameHistLen; i++) g_posHist[i] = g_gameHist[i];
@@ -1393,4 +1409,11 @@ getAIMove(int board[10][9], int searchDepth, bool isMaxTurn)
     }
     g_posHistLen = g_gameHistLen; // 复位搜索路径
     return bestMove;
+}
+
+//在全局棋盘 coreBoard 上正式落子（人机对战时玩家/AI 走子后调用）
+void executeMove(Move m) {
+    if (!inBoard(m.x1, m.y1) || !inBoard(m.x2, m.y2)) return;
+    coreBoard[m.x2][m.y2] = coreBoard[m.x1][m.y1];
+    coreBoard[m.x1][m.y1] = 0;
 }
