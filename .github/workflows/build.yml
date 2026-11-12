@@ -1,0 +1,60 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            qt_version: '6.7.0'
+            qt_arch: 'win64_msvc2019_64'
+            qt_install_path: '6.7.0/msvc2019_64'
+          - os: ubuntu-latest
+            qt_version: '6.7.0'
+            qt_arch: 'linux_gcc_64'
+            qt_install_path: '6.7.0/gcc_64'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Qt (Windows)
+      if: runner.os == 'Windows'
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: ${{ matrix.qt_version }}
+        arch: ${{ matrix.qt_arch }}
+        install-path: '${{ github.workspace }}/Qt'
+        cached: true
+
+    - name: Install Qt (Linux)
+      if: runner.os == 'Linux'
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: ${{ matrix.qt_version }}
+        arch: ${{ matrix.qt_arch }}
+        install-path: '${{ github.workspace }}/Qt'
+        cached: true
+
+    - name: CMake Configure
+      run: cmake -B build -S gui -DCMAKE_PREFIX_PATH="${{ env.QT_DIR }}"
+
+    - name: Build
+      run: cmake --build build -j
+
+    - name: Upload Artifact
+      if: runner.os == 'Windows'
+      uses: actions/upload-artifact@v4
+      with:
+        name: candy-xiangqi-${{ matrix.os }}
+        path: build/Release/
+        if-no-files-found: ignore
