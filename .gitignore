@@ -1,0 +1,61 @@
+# ===== 编译产物 =====
+build*/
+cmake-build-*/
+out/
+x64/
+Debug/
+Release/
+
+# Qt Creator / VS
+.vs/
+.vscode/
+.idea/
+.qtc_clangd/
+CMakeLists.txt.user
+CMakeLists.txt.user.*
+*.pro.user
+*.autosave
+*.qtvscr
+
+# Qt 自动生成
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# 编译器
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.so
+*.a
+*.dylib
+*.pdb
+*.ilk
+*.exp
+*.tlog/
+*.ipch/
+*.sdf
+*.db
+*.db-shm
+*.db-wal
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 安装包/发布物
+*.apk
+*.zip
+setup.iss
+windeployqt*/
+dist/
+
+# 大媒体资源（可选：保留源码引用，发布时用）
+# avatar/*.jpg avatar/*.gif
+# bg/*.jpg
+# music/*.mp3
+# sounds/*.wav
+# stickers/*.jpg
+# videos/*.gif
