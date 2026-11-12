@@ -5,15 +5,22 @@
 #include <QSettings>
 
 // 互联网服务器地址配置
-// 地址不写死在客户端：首次使用时由玩家在登录界面手动填写（房主提供），
-// 之后也可以在主菜单左下角「服务器」随时修改，值持久化在 QSettings。
+// 默认地址写死为阿里云 ECS 固定 IP（frp 隧道），玩家开箱即用无需填写；
+// 仍可在主菜单左下角「服务器」修改，值持久化在 QSettings（修改后优先于默认值）。
 namespace ServerConfig {
 
-// 当前服务器 URL（未配置时返回空串）
+// 默认服务器地址（注册表为空时使用）
+inline QString defaultServerUrl()
+{
+    return QStringLiteral("http://118.31.237.140:3000");
+}
+
+// 当前服务器 URL（未配置时返回默认地址）
 inline QString serverUrl()
 {
     QSettings s;
-    return s.value("server/url").toString().trimmed();
+    QString u = s.value("server/url").toString().trimmed();
+    return u.isEmpty() ? defaultServerUrl() : u;
 }
 
 // 是否已配置服务器地址

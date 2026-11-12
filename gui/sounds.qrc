@@ -10,5 +10,21 @@
         <file>sounds/capture_red.wav</file>
         <file>sounds/check_red.wav</file>
         <file>sounds/lose_red.wav</file>
+        <file>sounds/voice/welcome.wav</file>
+        <file>sounds/voice/heng.wav</file>
+        <file>sounds/voice/kewu.wav</file>
+        <file>sounds/voice/aiyo.wav</file>
+        <file>sounds/voice/wow.wav</file>
+        <file>sounds/voice/lihai.wav</file>
+        <file>sounds/voice/jiayou.wav</file>
+        <file>sounds/voice/wuwu.wav</file>
+        <file>sounds/voice/giggle.wav</file>
+        <file>sounds/voice/hmm.wav</file>
+        <file>sounds/voice/v1.wav</file>
+        <file>sounds/voice/v2.wav</file>
+        <file>sounds/voice/v3.wav</file>
+        <file>sounds/voice/v4.wav</file>
+        <file>sounds/voice/v5.wav</file>
+        <file>sounds/voice/v6.wav</file>
     </qresource>
 </RCC>

@@ -36,6 +36,25 @@ struct FriendRequestInfo {
     QString message;   // 验证消息（可选）
 };
 
+// 系统邮件（GET /api/mails 返回元素）
+struct MailInfo {
+    int id = 0;
+    QString title;
+    QString body;
+    QString attachKind;    // "" 无 | coins | candy0 | candy1 | candy2
+    int attachAmount = 0;
+    bool claimed = false;
+    QString createdAt;
+};
+
+// 进行中的互联网对局（GET /api/rooms 返回元素，点击可进入观战）
+struct LiveRoomInfo {
+    QString roomId;
+    UserInfo red;          // 房主=红方
+    UserInfo black;
+    int spectators = 0;    // 当前观战人数
+};
+
 // REST API 客户端：register / login / refresh / logout / me
 // 所有方法异步，结果通过信号返回（错误也走 errorOccurred 信号，不抛异常）
 // 阶段 1 只用前 5 个接口；阶段 2 起会扩展好友/对局历史等
@@ -89,8 +108,10 @@ public:
     void setTitle(const QString &accessToken, const QString &title);
     // GET /api/users/:id/profile 查看好友资料 → userProfileOk
     void getUserProfile(const QString &accessToken, int userId);
-    // 下载头像图（GET /avatars/xxx.png）
+    // 下载头像图（GET /avatars/xxx.png；带磁盘缓存：命中即发信号秒回，未命中下载后裁圆存缓存）
     void downloadAvatar(const QString &url);
+    // 头像磁盘缓存路径（无缓存返回空串）
+    static QString avatarCachePath(const QString &url);
 
     // ---------- 阶段 2：好友 ----------
     // GET /api/friends
@@ -110,6 +131,24 @@ public:
     void unblockFriend(const QString &accessToken, int userId);
     // GET /api/friends/blocked
     void listBlockedFriends(const QString &accessToken);
+
+    // ---------- 道具库存 / 系统邮件 ----------
+    // GET /api/inventory → inventoryOk(money, candy0..2)
+    void fetchInventory(const QString &accessToken);
+    // POST /api/inventory  body {deltas:{key:±n}}  key ∈ money/candy0..2 → inventoryOk
+    void pushInventory(const QString &accessToken, const QString &key, int delta);
+    // GET /api/mails → mailsOk
+    void listMails(const QString &accessToken);
+    // POST /api/mails/claim  body {id} → mailClaimOk
+    void claimMail(const QString &accessToken, int mailId);
+
+    // ---------- 观战 ----------
+    // GET /api/rooms → roomsOk（轮询用：失败静默，不弹错误框）
+    void listRooms(const QString &accessToken);
+
+    // ---------- 邀约机器人 ----------
+    // GET /api/bot/targets → botTargetsOk（轮询用：失败静默）
+    void fetchBotTargets(const QString &accessToken);
 
     // refresh_token 持久化（QSettings）
     static QString loadRefreshToken();
@@ -136,6 +175,17 @@ signals:
     void friendBlocked();
     void friendUnblocked();
     void blockedFriendsOk(const QList<UserInfo> &blocked);
+
+    // 道具库存 / 系统邮件信号
+    void inventoryOk(int money, int candy0, int candy1, int candy2);
+    void mailsOk(const QList<MailInfo> &mails);
+    void mailClaimOk(int mailId, int money, int candy0, int candy1, int candy2);
+
+    // 进行中对局列表（观战入口）
+    void roomsOk(const QList<LiveRoomInfo> &rooms);
+
+    // 邀约机器人目标列表（在线且空闲的真人 id）
+    void botTargetsOk(const QList<int> &targets);
 
     // 手机验证码信号
     void sendCodeOk(const QString &devCode);  // 开发期回显验证码

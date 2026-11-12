@@ -28,6 +28,14 @@ void NetworkManager::attachInternet(InternetClient *ic)
     connect(ic, &InternetClient::resignReceived, this, &NetworkManager::resignReceived);
     connect(ic, &InternetClient::badMoveReceived, this, &NetworkManager::badMoveReceived);
     connect(ic, &InternetClient::peerDisconnected, this, &NetworkManager::disconnected);
+    // 观战事件：对局结束/房间销毁对观战者等同"对方断开"（收摊关窗）
+    connect(ic, &InternetClient::spectateEnded, this, &NetworkManager::disconnected);
+    // spec_chat 带发信者 id+头像（观战聊天区显示圆头像），lambda 摘掉 id 再转发
+    connect(ic, &InternetClient::specChatReceived, this,
+            [this](int, const QString &fromName, const QString &fromAvatar, const QString &text) {
+        emit specChatReceived(fromName, fromAvatar, text);
+    });
+    connect(ic, &InternetClient::gameEndReceived, this, &NetworkManager::gameEndReceived);
 }
 
 NetworkManager::~NetworkManager()
@@ -294,7 +302,11 @@ void NetworkManager::sendMove(int x1, int y1, int x2, int y2)
 void NetworkManager::sendChat(const QString &text)
 {
     if (m_transport == Transport::Internet) {
-        m_internet->sendChat(text);
+        // 观战者不在房间里，走观战专用通道（服务器广播给双方+其他观众）
+        if (m_isSpectator)
+            m_internet->sendSpectateChat(text);
+        else
+            m_internet->sendChat(text);
         return;
     }
     sendLine(QStringLiteral("CHAT ") + text);
@@ -401,6 +413,13 @@ void NetworkManager::leaveRoom()
 {
     if (m_transport == Transport::Internet)
         m_internet->leaveRoom();
+}
+
+// 观战退出（仅互联网观战窗口关闭时调用）
+void NetworkManager::sendSpectateLeave()
+{
+    if (m_transport == Transport::Internet)
+        m_internet->spectateLeave();
 }
 
 void NetworkManager::sendLine(const QString &line)

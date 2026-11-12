@@ -119,6 +119,30 @@ void InternetClient::sendDm(int toUserId, const QString &text)
     sendEvent(QStringLiteral("dm"), d);
 }
 
+// ---------- 观战 ----------
+void InternetClient::spectateJoin(const QString &roomId)
+{
+    if (!ensureOpenForSend(QStringLiteral("spectate_join")))
+        return;
+    QJsonObject d;
+    d["room_id"] = roomId;
+    sendEvent(QStringLiteral("spectate_join"), d);
+}
+
+void InternetClient::spectateLeave()
+{
+    sendEvent(QStringLiteral("spectate_leave"), QJsonObject());
+}
+
+void InternetClient::sendSpectateChat(const QString &text)
+{
+    if (!isOpen())
+        return;
+    QJsonObject d;
+    d["text"] = text;
+    sendEvent(QStringLiteral("spectate_chat"), d);
+}
+
 // ---------- 阶段 3：对局事件 ----------
 void InternetClient::sendMove(int x1, int y1, int x2, int y2)
 {
@@ -228,7 +252,8 @@ void InternetClient::onTextMessage(const QString &text)
         emit friendAdded(parseUser(d.value("user").toObject()));
     } else if (event == QLatin1String("invite")) {
         emit inviteReceived(d.value("from_user_id").toInt(),
-                            d.value("from_name").toString());
+                            d.value("from_name").toString(),
+                            d.value("from_avatar").toString());
     } else if (event == QLatin1String("invite_declined")) {
         emit inviteDeclined(d.value("from_user_id").toInt());
     } else if (event == QLatin1String("gift")) {
@@ -238,6 +263,7 @@ void InternetClient::onTextMessage(const QString &text)
     } else if (event == QLatin1String("dm")) {
         emit dmReceived(d.value("from_user_id").toInt(),
                         d.value("from_name").toString(),
+                        d.value("from_avatar").toString(),
                         d.value("text").toString());
     } else if (event == QLatin1String("match_ready")) {
         emit matchReady(d.value("room_id").toString(),
@@ -283,5 +309,19 @@ void InternetClient::onTextMessage(const QString &text)
         emit resignReceived();
     } else if (event == QLatin1String("disconnect")) {
         emit peerDisconnected();
+    } else if (event == QLatin1String("spectate_start")) {
+        emit spectateStarted(d.value("room_id").toString(),
+                             parseUser(d.value("red").toObject()),
+                             parseUser(d.value("black").toObject()),
+                             d.value("moves").toArray());
+    } else if (event == QLatin1String("spectate_end")) {
+        emit spectateEnded(d.value("reason").toString());
+    } else if (event == QLatin1String("spec_chat")) {
+        emit specChatReceived(d.value("from_user_id").toInt(),
+                              d.value("from_name").toString(),
+                              d.value("from_avatar").toString(),
+                              d.value("text").toString());
+    } else if (event == QLatin1String("game_end")) {
+        emit gameEndReceived(d.value("result").toString());
     }
 }

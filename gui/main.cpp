@@ -3,8 +3,10 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QPolygonF>
+#include <QStringList>
 #include "MainWindow.h"
 #include "StartScreen.h"
+#include "ServerConfig.h"
 
 #ifndef Q_OS_ANDROID
 // 自绘一枚放大的箭头光标：白色箭头 + 粗黑描边，在任何棋盘背景上都醒目。
@@ -52,7 +54,26 @@ int main(int argc, char* argv[])
 #endif
     // 必须堆分配：StartScreen 构造函数会把自身地址记入 s_liveMenu，
     // 之后回主菜单时新实例会 delete 旧实例——栈对象被 delete 会直接堆崩溃
+    // 机器人模式：--bot <user> <pass> <red|black> <oppId>
+    // （无人值守女号对局：红方定时邀请 oppId，黑方等邀请，进局挂机代打，无窗口运行）
+    const QStringList args = app.arguments();
+    const int botIdx = args.indexOf(QStringLiteral("--bot"));
+    if (botIdx > 0 && botIdx + 4 < args.size()) {
+        // 注册表命名空间隔离：机器人配置写到 gui-bot，不污染玩家配置（尤其 server/url）
+        QApplication::setApplicationName(QStringLiteral("gui-bot"));
+        StartScreen::s_botMode = true;
+        StartScreen::s_botUser = args.at(botIdx + 1);
+        StartScreen::s_botPass = args.at(botIdx + 2);
+        StartScreen::s_botRole = args.at(botIdx + 3).toLower();
+        StartScreen::s_botOppId = args.at(botIdx + 4);
+    }
+    // 机器人服务器地址：--bot-url http://127.0.0.1:8080（写进隔离后的 gui-bot 命名空间）
+    const int urlIdx = args.indexOf(QStringLiteral("--bot-url"));
+    if (urlIdx > 0 && urlIdx + 1 < args.size())
+        ServerConfig::setServerUrl(args.at(urlIdx + 1));
     StartScreen *start = new StartScreen;
+    if (StartScreen::s_botMode)
+        return app.exec();   // 机器人不显示主菜单窗口，事件循环驱动即可
 #ifdef Q_OS_ANDROID
     start->showMaximized();
 #else

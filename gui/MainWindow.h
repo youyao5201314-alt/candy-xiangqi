@@ -4,6 +4,7 @@
 #include <QMainWindow>
 #include <QPixmap>
 #include <QThread>
+#include <QJsonArray>
 #include <vector>
 #include "board.h"
 
@@ -94,6 +95,28 @@ public:
     void renderBoard(QPainter &p, const QSize &viewSize);
     void handleBoardPress(const QPoint &pos, const QSize &viewSize, bool rightButton);
 
+    // 本机登录昵称（StartScreen 登录后写入）：观战时只有 @我 的语音才出声，避免一堆背景音
+    static QString s_localName;
+    // 当前是否有打开的对局/观战窗（构造++析构--）：对局中私信不弹窗贴脸的可靠依据
+    // （QApplication::activeWindow() 在安卓/瞬态窗口下不可靠，曾导致对局中私信弹窗贴脸）
+    static bool gameWindowOpen() { return s_openGameWindows > 0; }
+    // 机器人代打模式（命令行 --bot 启动）：压制终局弹窗，终局后自动关窗重开
+    void setBotPlay(bool v) { m_botPlay = v; }
+    // 跳过召唤动画直接开启奶娃挂机代打（机器人专用，红黑双方都可用）
+    void enableBotAfk();
+    // 中途加入观战：按服务器下发的着法历史从初始布局快放到当前局面（静音、不判胜负）
+    void replayMoves(const QJsonArray &moves);
+    // 程序内部清理窗口（不触发"关窗回主菜单"）：收摊观战窗/旧对局窗时用，
+    // 避免 closeEvent 里 new StartScreen 把正在堆栈上执行的旧主菜单 delete 掉（野指针崩溃）
+    void setSilentClose(bool v) { m_silentClose = v; }
+
+private:
+    static int s_openGameWindows;   // 打开中的对局/观战窗计数（见 gameWindowOpen）
+    bool m_openCounted = false;     // 本窗是否已计入 s_openGameWindows（close 时--，析构兜底）
+
+    // 落子滑动动画：走子落定后调用，棋子在棋盘上从起点滑向终点（约 160ms）
+    void animateMove(const Move &mv);
+
 private slots:
     void restartGame();   // 重新开局
     void undoMove();      // 悔棋（撤销 AI + 玩家各一手）
@@ -120,6 +143,9 @@ private slots:
     void onPeerDisconnected();                                     // 对方掉线
     void onNetworkProfile(const QString &name, const QString &title,
                           const QString &avatarUrl, bool senderRed); // 收到对方名片
+    void onSpecChatReceived(const QString &fromName, const QString &fromAvatar,
+                            const QString &text); // 观众/玩家发言（带头像）
+    void onGameEndReceived(const QString &result);               // 对局终局结果
     void sendChatMessage();                                        // 发送聊天
     void sendUndoRequest();                                        // 联机：发送悔棋请求
     void sendRestartRequest();                                     // 联机：发送重新开始请求
@@ -160,12 +186,14 @@ private:
     PlayerCardInfo m_oppInfo;
     QFrame *m_cardTop = nullptr;      // 黑方名片
     QFrame *m_cardBottom = nullptr;   // 红方名片
-    QLabel *m_topAvatar = nullptr, *m_topName = nullptr, *m_topTitle = nullptr;
-    QLabel *m_botAvatar = nullptr, *m_botName = nullptr, *m_botTitle = nullptr;
+    QLabel *m_topAvatar = nullptr, *m_topName = nullptr, *m_topTitle = nullptr, *m_topTag = nullptr;
+    QLabel *m_botAvatar = nullptr, *m_botName = nullptr, *m_botTitle = nullptr, *m_botTag = nullptr;
     QNetworkAccessManager *m_cardNam = nullptr;
     void buildPlayerCards(QWidget *parent, QVBoxLayout *root);  // 构造时建名片
     void applySideProfile(bool redSide, const PlayerCardInfo &info);  // 按执子方填名片
     void fillCard(bool redSide, const PlayerCardInfo &info);          // 刷新一侧名片
+    // 按位置填名片（bottom=true 棋盘下）：本机视角自己永远在下，卡片底色/阵营标按实际执子方
+    void fillCardPos(bool bottom, const PlayerCardInfo &info, bool infoRed);
     void loadCardAvatar(QLabel *lbl, const QString &url,
                         const QString &name, int seed);               // 异步下载/默认头像
     static QPixmap makeDefaultAvatar(const QString &name, int seed, int size);
@@ -206,6 +234,7 @@ private:
     int m_musicSel = 0;                  // 音乐下拉框上次确认的选择（取消自定义时回退用）
     QTimer *m_animTimer = nullptr;    // 将帅被将军的呼吸动画
     QTimer *m_thinkTimer = nullptr;   // 思考计时刷新
+    QTimer *m_afkTimer = nullptr;     // 挂机走子延时触发（单次，替代 singleShot 防堆叠）
     QElapsedTimer *m_thinkClock = nullptr;
     AiThread *m_aiThread = nullptr;
     qreal m_animPhase = 0.0;          // 将军呼吸动画相位
@@ -216,6 +245,19 @@ private:
 
     Move m_last;                    // 最近一步棋
     bool m_hasLast = false;
+
+    // 落子滑动动画状态：paint 时跳过终点静态棋子，改画滑动中的棋子
+    Move m_moveAnim;                // 当前动画的着法（起/止）
+    int m_moveAnimPiece = 0;        // 滑动中的棋子代码
+    int m_moveAnimFrame = 0;        // 当前帧
+    bool m_moveAnimActive = false;
+    QTimer *m_moveAnimTimer = nullptr;
+    static const int kMoveAnimFrames = 10;   // 10 帧 × 16ms ≈ 160ms
+
+    // 棋子字体缓存：renderBoard 60fps 动画时每次创建 QFont 有开销，
+    // 按 cell 像素尺寸缓存，窗口 resize 时才重建
+    mutable QFont m_pieceFont;
+    mutable int m_pieceFontCell = 0;   // 缓存字体对应的 cell 像素宽
 
     std::vector<Step> m_history;    // 对局走子历史（悔棋用）
     bool m_gameOver = false;        // 对局是否已结束（结束后锁定点击）
@@ -259,6 +301,17 @@ private:
     int settleMoney(int outcome);
     // 胜利成就统计：按模式/残局记账并识别杀法称号，解锁时弹窗（killName 空=非将死杀法）
     void reportWinAchievements(const QString &killName);
+    // ===== 机器人代打 =====
+    bool m_botPlay = false;              // 机器人模式：压制弹窗，终局自动关窗重开
+    bool m_silentClose = false;          // 程序内部清理关窗：closeEvent 不拉起新主菜单
+    QTimer *m_botChatTimer = nullptr;    // 机器人随机闲聊定时器
+    void botRestartLoop();               // 终局后稍等关窗（进程退出由编排脚本重启）
+    static QString botChatLine();        // 随机闲聊语料（表情标记/短语）
+
+    // 女号语音：消息前缀 [voice:xxx] 触发播放（sounds/voice/xxx.wav，懒加载池）
+    // ambient=true（观战席/房间闲聊）：只有提到本机昵称才出声，避免一堆背景音
+    void maybePlayVoice(QString &text, bool ambient);  // 检测并摘除前缀、播放；无标记不动
+    QHash<QString, QSoundEffect*> m_voiceFx;
     // ===== 糖果指导（消耗品）=====
     bool candyAllowed() const;          // 当前模式是否允许用糖果（单机/局域网房客/互联网）
     int candyCount(int idx) const;      // 糖果剩余数量

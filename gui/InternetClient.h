@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QList>
+#include <QJsonArray>
 #include "api.h"
 
 class QWebSocket;
@@ -34,6 +35,13 @@ public:
     // 好友私信（文字或奶龙表情标记，仅在线好友）
     void sendDm(int toUserId, const QString &text);
 
+    // ---------- 观战 ----------
+    // 观战加入进行中的对局（服务器回 spectate_start 带双方名片）
+    void spectateJoin(const QString &roomId);
+    void spectateLeave();
+    // 观战者发言：对局双方与其他观战者都能看到
+    void sendSpectateChat(const QString &text);
+
     // ---------- 阶段 3：对局事件（信号签名与 NetworkManager 对齐） ----------
     void sendMove(int x1, int y1, int x2, int y2);
     void sendChat(const QString &text);
@@ -52,14 +60,25 @@ signals:
     void presenceChanged(int userId, bool online);
     void friendRequestReceived(int requestId, const UserInfo &from, const QString &message);
     void friendAdded(const UserInfo &user);
-    void inviteReceived(int fromUserId, const QString &fromName);
+    void inviteReceived(int fromUserId, const QString &fromName, const QString &fromAvatar);
     void inviteDeclined(int fromUserId);
     void giftReceived(int fromUserId, const QString &fromName, const QString &text);
-    void dmReceived(int fromUserId, const QString &fromName, const QString &text);
+    void dmReceived(int fromUserId, const QString &fromName, const QString &fromAvatar,
+                    const QString &text);
     void matchReady(const QString &roomId, const QString &side, const UserInfo &opponent);
     void matchClosed(const QString &roomId, const QString &reason);
     void serverError(const QString &code, const QString &msg);
     void socketClosed();
+
+    // 观战事件
+    // spectateStarted 带着法历史：中途加入时客户端回放同步到当前局面
+    void spectateStarted(const QString &roomId, const UserInfo &red, const UserInfo &black,
+                         const QJsonArray &moves);
+    void spectateEnded(const QString &reason);   // 对局结束/一方离开，观战收摊
+    // spec_chat 带头像 URL（服务器 bot 女号发言自带头像，观众聊天区显示圆头像）
+    void specChatReceived(int fromUserId, const QString &fromName, const QString &fromAvatar,
+                          const QString &text);
+    void gameEndReceived(const QString &result); // red_win / black_win / draw
 
     // 对局事件（与 NetworkManager 同名信号一一对应，便于桥接）
     void moveReceived(int x1, int y1, int x2, int y2);

@@ -22,7 +22,7 @@ static QLabel *makeSectionTitle(const QString &emoji, const QString &text, QWidg
 BagDialog::BagDialog(QWidget *parent)
     : QDialog(parent)
 {
-    setWindowTitle(QStringLiteral("🎒 我的背包"));
+    setWindowTitle(QStringLiteral("我的背包"));
     resize(480, 680);
     rebuild();
 }
@@ -33,7 +33,7 @@ void BagDialog::rebuild()
     v->setContentsMargins(20, 16, 20, 16);
     v->setSpacing(10);
 
-    auto *title = new QLabel(QStringLiteral("🎒 我的背包"), this);
+    auto *title = new QLabel(QStringLiteral("我的背包"), this);
     title->setAlignment(Qt::AlignCenter);
     title->setStyleSheet(QStringLiteral(
         "font-size:24px;font-weight:bold;color:#333;"));

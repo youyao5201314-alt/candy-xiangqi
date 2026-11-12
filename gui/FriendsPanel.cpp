@@ -2,6 +2,7 @@
 #include "FriendsPanel.h"
 #include "ChatDialog.h"
 #include "InternetClient.h"
+#include "MainWindow.h"
 #include "ProfileViewDialog.h"
 #include "Inventory.h"
 #include "ServerConfig.h"
@@ -10,7 +11,11 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPushButton>
+#include <QToolButton>
+#include <QMenu>
+#include <QAction>
 #include <QListWidget>
+#include <QApplication>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QMessageBox>
@@ -21,6 +26,7 @@
 #include <QGridLayout>
 #include <QSettings>
 #include <QPainter>
+#include <QTimer>
 #include <QPainterPath>
 #include <QRegularExpression>
 
@@ -44,37 +50,63 @@ FriendsPanel::FriendsPanel(ApiClient *api, InternetClient *net,
     m_status->setStyleSheet(QStringLiteral("color:#888;"));
     root->addWidget(m_status);
 
+    // "正在对局"观战区：仅对战页提供（定时轮询，双击/按钮进观战）
+    if (allowInvite) {
+        auto *roomsTitle = new QLabel(QStringLiteral("⚔️ 正在对局（双击或点「观战」进入观战）"), this);
+        roomsTitle->setStyleSheet(QStringLiteral("font-size:14px;color:#555;"));
+        root->addWidget(roomsTitle);
+        m_roomsList = new QListWidget(this);
+        m_roomsList->setStyleSheet(QStringLiteral("font-size:15px;"));
+        m_roomsList->setIconSize(QSize(28, 28));
+        m_roomsList->setMaximumHeight(112);
+        m_roomsList->setAlternatingRowColors(false);
+        root->addWidget(m_roomsList);
+        m_roomsTimer = new QTimer(this);
+        connect(m_roomsTimer, &QTimer::timeout, this, &FriendsPanel::refreshRooms);
+        connect(m_roomsList, &QListWidget::itemDoubleClicked, this,
+                [this](QListWidgetItem *) { onSpectateRoom(); });
+    }
+
     m_list = new QListWidget(this);
     m_list->setStyleSheet(QStringLiteral("font-size:16px;"));
     m_list->setMinimumHeight(240);
     m_list->setIconSize(QSize(36, 36));
     root->addWidget(m_list, 1);
 
+    // 底部工具条：高频操作平铺，低频操作收进「更多」菜单，退出登录靠右
     auto *btnRow = new QHBoxLayout();
+    btnRow->setSpacing(8);
     auto *backBtn = new QPushButton(QStringLiteral("返回"), this);
     auto *addBtn = new QPushButton(QStringLiteral("添加好友"), this);
     auto *inviteBtn = new QPushButton(QStringLiteral("邀请对战"), this);
     auto *chatBtn = new QPushButton(QStringLiteral("私信"), this);
-    auto *blockBtn = new QPushButton(QStringLiteral("拉黑"), this);
-    auto *giftBtn = new QPushButton(QStringLiteral("送礼"), this);
-    auto *profileBtn = new QPushButton(QStringLiteral("资料"), this);
-    auto *refreshBtn = new QPushButton(QStringLiteral("刷新"), this);
+    auto *moreBtn = new QToolButton(this);
+    moreBtn->setText(QStringLiteral("更多 ▾"));
+    moreBtn->setPopupMode(QToolButton::InstantPopup);
+    auto *moreMenu = new QMenu(moreBtn);
+    moreBtn->setMenu(moreMenu);
+    auto *spectateAct = moreMenu->addAction(QStringLiteral("观战"));
+    moreMenu->addSeparator();
+    auto *giftAct = moreMenu->addAction(QStringLiteral("送礼"));
+    auto *profileAct = moreMenu->addAction(QStringLiteral("资料"));
+    auto *blockAct = moreMenu->addAction(QStringLiteral("拉黑"));
+    moreMenu->addSeparator();
+    auto *refreshAct = moreMenu->addAction(QStringLiteral("刷新"));
     btnRow->addWidget(backBtn);
     btnRow->addWidget(addBtn);
     btnRow->addWidget(inviteBtn);
     btnRow->addWidget(chatBtn);
-    btnRow->addWidget(blockBtn);
-    btnRow->addWidget(giftBtn);
-    btnRow->addWidget(profileBtn);
-    btnRow->addWidget(refreshBtn);
-    root->addLayout(btnRow);
+    btnRow->addWidget(moreBtn);
+    btnRow->addStretch();
 
     auto *logoutBtn = new QPushButton(QStringLiteral("退出登录"), this);
-    root->addWidget(logoutBtn);
+    btnRow->addWidget(logoutBtn);
+    root->addLayout(btnRow);
 
     // 独立好友入口（简洁模式）：不提供开局邀请和退出登录
     if (!allowInvite) {
         inviteBtn->setVisible(false);
+        spectateAct->setVisible(false);
         logoutBtn->setVisible(false);
     }
 
@@ -83,8 +115,15 @@ FriendsPanel::FriendsPanel(ApiClient *api, InternetClient *net,
     // 头像下载完成：按 URL 找到对应好友项，圆形裁剪后回填图标
     connect(m_api, &ApiClient::avatarDownloaded, this,
             [this](const QString &url, const QPixmap &pm) {
+        // 观战区头像：入缓存并重绘对局列表。
+        // 同一头像可能同时挂在好友列表（女号常在对局中），不能提前 return
+        if (m_roomAvatarFetching.remove(url)) {
+            m_roomAvatars.insert(url, pm);
+            rebuildRoomList();
+        }
         if (!m_friendIdByUrl.contains(url))
             return;
+        m_friendAvatars.insert(url, pm);   // 入缓存：presence 重建列表时秒回填
         const int fid = m_friendIdByUrl.value(url);
         for (int i = 0; i < m_list->count(); ++i) {
             QListWidgetItem *it = m_list->item(i);
@@ -94,6 +133,7 @@ FriendsPanel::FriendsPanel(ApiClient *api, InternetClient *net,
             }
         }
     });
+    connect(m_api, &ApiClient::roomsOk, this, &FriendsPanel::onRoomsOk);
     connect(m_api, &ApiClient::friendRequestsOk, this, &FriendsPanel::onFriendRequestsOk);
     connect(m_api, &ApiClient::friendRequestSent, this, &FriendsPanel::onFriendRequestSent);
     connect(m_api, &ApiClient::friendAccepted, this, &FriendsPanel::onFriendAccepted);
@@ -125,7 +165,7 @@ FriendsPanel::FriendsPanel(ApiClient *api, InternetClient *net,
     connect(addBtn, &QPushButton::clicked, this, &FriendsPanel::onAddFriend);
     connect(m_api, &ApiClient::searchOk, this, &FriendsPanel::onSearchOk);
     connect(inviteBtn, &QPushButton::clicked, this, &FriendsPanel::onInviteSelected);
-    connect(blockBtn, &QPushButton::clicked, this, [this]() {
+    connect(blockAct, &QAction::triggered, this, [this]() {
         QListWidgetItem *cur = m_list->currentItem();
         if (!cur) {
             QMessageBox::information(this, QStringLiteral("拉黑"),
@@ -143,7 +183,7 @@ FriendsPanel::FriendsPanel(ApiClient *api, InternetClient *net,
         if (ret == QMessageBox::Yes)
             m_api->blockFriend(m_token, id);
     });
-    connect(profileBtn, &QPushButton::clicked, this, [this]() {
+    connect(profileAct, &QAction::triggered, this, [this]() {
         QListWidgetItem *cur = m_list->currentItem();
         if (!cur && !m_list->selectedItems().isEmpty())
             cur = m_list->selectedItems().first();
@@ -155,7 +195,7 @@ FriendsPanel::FriendsPanel(ApiClient *api, InternetClient *net,
         ProfileViewDialog dlg(m_api, m_token, cur->data(Qt::UserRole).toInt(), this);
         dlg.exec();
     });
-    connect(giftBtn, &QPushButton::clicked, this, [this]() {
+    connect(giftAct, &QAction::triggered, this, [this]() {
         QListWidgetItem *cur = m_list->currentItem();
         if (!cur && !m_list->selectedItems().isEmpty())
             cur = m_list->selectedItems().first();
@@ -240,11 +280,16 @@ FriendsPanel::FriendsPanel(ApiClient *api, InternetClient *net,
         // 离线也允许私信：服务端存离线消息，对方上线时自动送达
         onDmReceived(id,
                      f->display_name.isEmpty() ? f->username : f->display_name,
+                     f->avatar_url,
                      QString());   // 空文本=只打开窗口不追加消息
         if (!f->online)
             m_status->setText(QStringLiteral("对方当前不在线，留言将在 TA 上线时送达"));
     });
-    connect(refreshBtn, &QPushButton::clicked, this, &FriendsPanel::refreshFriends);
+    connect(refreshAct, &QAction::triggered, this, [this]() {
+        refreshFriends();
+        refreshRooms();
+    });
+    connect(spectateAct, &QAction::triggered, this, &FriendsPanel::onSpectateRoom);
     connect(backBtn, &QPushButton::clicked, this, &FriendsPanel::back);
     connect(logoutBtn, &QPushButton::clicked, this, &FriendsPanel::logout);
     // 双击在线好友直接邀请
@@ -257,11 +302,90 @@ void FriendsPanel::start()
     m_status->setText(QStringLiteral("已连接，正在加载好友…"));
     refreshFriends();
     m_api->listFriendRequests(m_token);
+    // 观战区：立即拉一次 + 定时轮询（8 秒）
+    if (m_roomsList) {
+        refreshRooms();
+        if (m_roomsTimer)
+            m_roomsTimer->start(8000);
+    }
 }
 
 void FriendsPanel::refreshFriends()
 {
     m_api->listFriends(m_token);
+}
+
+// ===================== "正在对局"观战区 =====================
+void FriendsPanel::refreshRooms()
+{
+    if (m_roomsList)
+        m_api->listRooms(m_token);
+}
+
+void FriendsPanel::onRoomsOk(const QList<LiveRoomInfo> &rooms)
+{
+    m_lastRooms = rooms;
+    rebuildRoomList();
+}
+
+void FriendsPanel::rebuildRoomList()
+{
+    if (!m_roomsList)
+        return;
+    // 保留当前选中行（轮询重绘时不打断用户选择）
+    const QString cur = m_roomsList->currentItem()
+        ? m_roomsList->currentItem()->data(Qt::UserRole).toString()
+        : QString();
+    m_roomsList->clear();
+
+    if (m_lastRooms.isEmpty()) {
+        QListWidgetItem *it = new QListWidgetItem(
+            QStringLiteral("暂时没有进行中的对局"), m_roomsList);
+        it->setFlags(Qt::NoItemFlags);
+        it->setForeground(QColor(0x99, 0x99, 0x99));
+        return;
+    }
+
+    for (const LiveRoomInfo &r : m_lastRooms) {
+        const QString redName = r.red.display_name.isEmpty()
+            ? r.red.username : r.red.display_name;
+        const QString blackName = r.black.display_name.isEmpty()
+            ? r.black.username : r.black.display_name;
+        QListWidgetItem *it = new QListWidgetItem(QStringLiteral(
+            "🔴 %1   ⚔️   ⚫ %2      👁 %3 人围观").arg(redName, blackName).arg(r.spectators),
+            m_roomsList);
+        it->setData(Qt::UserRole, r.roomId);
+
+        // 图标：红方头像（缓存直用，否则发一次下载，完成后重绘）
+        const QString url = r.red.avatar_url;
+        if (!url.isEmpty() && m_roomAvatars.contains(url)) {
+            it->setIcon(QIcon(circleAvatar(m_roomAvatars.value(url), 28)));
+        } else if (!url.isEmpty() && !m_roomAvatarFetching.contains(url)) {
+            m_roomAvatarFetching.insert(url);
+            m_api->downloadAvatar(ServerConfig::serverUrl() + url);
+            it->setIcon(QIcon(defaultAvatar(redName, r.red.id)));
+        } else {
+            it->setIcon(QIcon(defaultAvatar(redName, r.red.id)));
+        }
+        if (r.roomId == cur)
+            m_roomsList->setCurrentItem(it);
+    }
+}
+
+void FriendsPanel::onSpectateRoom()
+{
+    if (!m_roomsList)
+        return;
+    QListWidgetItem *cur = m_roomsList->currentItem();
+    if (!cur && !m_roomsList->selectedItems().isEmpty())
+        cur = m_roomsList->selectedItems().first();
+    if (!cur)
+        return;
+    const QString roomId = cur->data(Qt::UserRole).toString();
+    if (roomId.isEmpty())
+        return;
+    m_status->setText(QStringLiteral("正在进入观战…"));
+    emit spectateRequested(roomId);
 }
 
 void FriendsPanel::onFriendsOk(const QList<FriendInfo> &friends)
@@ -522,13 +646,19 @@ void FriendsPanel::rebuildList()
             QStringLiteral("%1（%2）").arg(name, f.username);
         auto *item = new QListWidgetItem(text, m_list);
         item->setData(Qt::UserRole, f.id);
-        // 头像：有自定义头像就异步下载回填，没有就用名字首字彩色圆头像
+        // 头像：先放彩色首字占位圆（永不留空），有自定义头像再替换为照片。
+        // presence 事件会频繁整体重建列表，图标必须每次都能立刻恢复
         if (!f.avatar_url.isEmpty()) {
             const QString full = ServerConfig::serverUrl() + f.avatar_url;
             m_friendIdByUrl.insert(full, f.id);
-            if (!m_fetchedAvatarUrls.contains(full)) {
-                m_fetchedAvatarUrls.insert(full);
-                m_api->downloadAvatar(full);
+            if (m_friendAvatars.contains(full)) {
+                item->setIcon(QIcon(circleAvatar(m_friendAvatars.value(full), 36)));
+            } else {
+                item->setIcon(QIcon(defaultAvatar(name, f.id)));
+                if (!m_fetchedAvatarUrls.contains(full)) {
+                    m_fetchedAvatarUrls.insert(full);
+                    m_api->downloadAvatar(full);
+                }
             }
         } else {
             item->setIcon(QIcon(defaultAvatar(name, f.id)));
@@ -617,6 +747,9 @@ void FriendsPanel::onGiftReceived(int fromUserId, const QString &fromName, const
     // 入背包：糖果计数/礼物清单/总数统一在 Inventory 维护
     Inventory::addGift(fromName, text);
     const Inventory::Gift g = Inventory::gifts().value(0);
+    // 对局中不弹窗打扰
+    if (qobject_cast<MainWindow*>(QApplication::activeWindow()))
+        return;
     QMessageBox box(this);
     box.setWindowTitle(QStringLiteral("收到礼物"));
     box.setTextFormat(Qt::RichText);
@@ -624,7 +757,7 @@ void FriendsPanel::onGiftReceived(int fromUserId, const QString &fromName, const
                     "<div align='center'>"
                     "<span style='font-size:46px;'>%1</span><br>"
                     "<b style='font-size:16px;'>%2</b> 送你一份%3<br>"
-                    "<span style='color:#888;'>已放入背包，去「🎒 背包」查看吧</span>"
+                    "<span style='color:#888;'>已放入背包，去「背包」查看吧</span>"
                     "</div>")
                     .arg(g.emoji.toHtmlEscaped(),
                          fromName.toHtmlEscaped(),
@@ -632,11 +765,19 @@ void FriendsPanel::onGiftReceived(int fromUserId, const QString &fromName, const
     box.exec();
 }
 
-void FriendsPanel::onDmReceived(int fromUserId, const QString &fromName, const QString &text)
+void FriendsPanel::onDmReceived(int fromUserId, const QString &fromName,
+                                const QString &fromAvatar, const QString &text)
 {
+    // 对局中（计数判定，activeWindow 在安卓/瞬态窗口下不可靠）：不弹独立聊天窗，
+    // 消息写入聊天窗缓存（不 show），回菜单后打开可见
+    const bool inGame = MainWindow::gameWindowOpen()
+                        || qobject_cast<MainWindow*>(QApplication::activeWindow());
     ChatDialog *dlg = m_chatDialogs.value(fromUserId, nullptr);
     if (!dlg) {
-        dlg = new ChatDialog(m_net, fromUserId, fromName, this);
+        FriendInfo *f = findFriend(fromUserId);
+        const QString avatar = f ? f->avatar_url : fromAvatar;  // 列表没加载完时用 dm 自带头像
+        dlg = new ChatDialog(m_net, m_self.id, fromUserId, fromName, this,
+                             avatar, m_api);
         // 窗口关闭时只隐藏+从表移除（下次收到再新建；Qt::WA_DeleteOnClose 更省事）
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         connect(dlg, &QObject::destroyed, this, [this, fromUserId]() {
@@ -646,6 +787,8 @@ void FriendsPanel::onDmReceived(int fromUserId, const QString &fromName, const Q
     }
     if (!text.isEmpty())
         dlg->receiveMessage(fromName, text);
+    if (inGame)
+        return;   // 对局中只缓存不贴脸
     dlg->show();
     dlg->raise();
     dlg->activateWindow();
@@ -656,4 +799,10 @@ FriendInfo *FriendsPanel::findFriend(int id)
     for (auto &f : m_friends)
         if (f.id == id) return &f;
     return nullptr;
+}
+
+QString FriendsPanel::friendAvatarUrl(int id)
+{
+    FriendInfo *f = findFriend(id);
+    return f ? f->avatar_url : QString();
 }

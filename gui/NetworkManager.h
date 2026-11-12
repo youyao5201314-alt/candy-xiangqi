@@ -75,6 +75,7 @@ public:
     void sendResign();      // 投降（LAN/Internet 均有效）
     void sendGameEnd(const QString &result);  // 终局上报（仅互联网落库，LAN 空操作）
     void leaveRoom();       // 离开对局房间（仅互联网，LAN 空操作）
+    void sendSpectateLeave(); // 观战退出（仅互联网观战窗口）
 
     bool isConnected() const;
     bool isSpectator() const { return m_isSpectator; }
@@ -100,6 +101,9 @@ signals:
     // 收到对方名片：selfRed=发送方是否执红（观战者据此摆放双方名片）
     void profileReceived(const QString &name, const QString &title,
                          const QString &avatarUrl, bool senderRed);
+    // 观战相关：观众/玩家发言（带名字）、对局终局结果
+    void specChatReceived(const QString &fromName, const QString &fromAvatar, const QString &text);
+    void gameEndReceived(const QString &result);   // red_win / black_win / draw
     void connected();        // 双方连接成功
     void disconnected();     // 对方断开连接
     void errorOccurred(const QString &msg);

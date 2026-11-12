@@ -490,9 +490,12 @@ void LoginDialog::onApiError(const QString &msg)
     m_phoneLoginBtn->setEnabled(true);
     m_guestBtn->setEnabled(true);
     m_regSendCodeBtn->setEnabled(true);
-    // 判断错误显示在哪个 Tab
-    if (m_phoneEdit && m_phoneEdit->hasFocus()) {
+    m_sendCodeBtn->setEnabled(true);
+    // 判断错误显示在哪个 Tab：根据当前可见的错误标签定位
+    if (m_phoneErrorLabel && m_phoneErrorLabel->isVisible()) {
         m_phoneErrorLabel->setText(msg);
+    } else if (m_guestErrorLabel && m_guestErrorLabel->isVisible()) {
+        m_guestErrorLabel->setText(msg);
     } else {
         m_errorLabel->setText(msg);
     }

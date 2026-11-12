@@ -75,4 +75,6 @@ msvc {
 # Android：自定义 Manifest（应用名等），目录结构与 Qt 模板一致
 android {
     ANDROID_PACKAGE_SOURCE_DIR = $$PWD/android
+    ANDROID_VERSION_NAME = 3.3
+    ANDROID_VERSION_CODE = 33
 }

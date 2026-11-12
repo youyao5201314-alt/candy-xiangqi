@@ -46,20 +46,71 @@ quint16 StartScreen::roomPort(const QString &code)
     return static_cast<quint16>(30000 + code.toUInt());
 }
 
-// 唯一存活的主菜单实例：对局结束新建主菜单时替换旧（隐藏）实例，
-// 旧实例持有的互联网 WebSocket 也随之切换到新实例（短暂离线后自动重连）
-static StartScreen *s_liveMenu = nullptr;
+namespace {
+// 对战邀请弹窗头像：圆形裁剪（56×56，弹窗图标比列表大一号）
+QPixmap inviteAvatar(const QPixmap &src)
+{
+    constexpr int SZ = 56;
+    QPixmap scaled = src.scaled(SZ, SZ, Qt::KeepAspectRatioByExpanding,
+                                Qt::SmoothTransformation);
+    const int x = (scaled.width() - SZ) / 2, y = (scaled.height() - SZ) / 2;
+    QPixmap out(SZ, SZ);
+    out.fill(Qt::transparent);
+    QPainter p(&out);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    QPainterPath path;
+    path.addEllipse(0, 0, SZ, SZ);
+    p.setClipPath(path);
+    p.drawPixmap(0, 0, scaled.copy(x, y, SZ, SZ));
+    p.end();
+    return out;
+}
+
+// 无自定义头像时：按 id 取色的彩色圆底 + 昵称首字（与好友列表同风格）
+QPixmap coloredAvatar(const QString &name, int id)
+{
+    constexpr int SZ = 56;
+    static const QColor palette[] = {
+        QColor(255, 138, 128), QColor(129, 199, 132), QColor(129, 212, 250),
+        QColor(206, 147, 216), QColor(255, 213, 79),  QColor(255, 171, 145),
+        QColor(120, 204, 205), QColor(240, 152, 190)
+    };
+    QPixmap out(SZ, SZ);
+    out.fill(Qt::transparent);
+    QPainter p(&out);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.setPen(Qt::NoPen);
+    p.setBrush(palette[qAbs(id) % 8]);
+    p.drawEllipse(0, 0, SZ, SZ);
+    p.setPen(Qt::white);
+    QFont f = p.font();
+    f.setPixelSize(26);
+    f.setBold(true);
+    p.setFont(f);
+    p.drawText(QRect(0, 0, SZ, SZ), Qt::AlignCenter, name.left(1).toUpper());
+    p.end();
+    return out;
+}
+} // namespace
+
+// 常驻主菜单实例：MainWindow 关闭时 show() 它，而不是 new 新实例
+// （避免 new StartScreen 触发构造函数 delete 旧实例的野指针崩溃）
+StartScreen *StartScreen::s_liveMenu = nullptr;
+
+// 机器人模式静态配置（gui.exe --bot <user> <pass> <red|black> <oppId>）
+bool StartScreen::s_botMode = false;
+QString StartScreen::s_botUser;
+QString StartScreen::s_botPass;
+QString StartScreen::s_botRole;
+QString StartScreen::s_botOppId;
 
 StartScreen::StartScreen(QWidget *parent)
     : QWidget(parent)
 {
-    // 销毁上一个被对局窗遮挡的主菜单（它的 WS 在本局刚结束、房间已离开后不再需要）
-    if (s_liveMenu && s_liveMenu != this) {
-        StartScreen *old = s_liveMenu;
-        s_liveMenu = nullptr;
-        old->m_wsWanted = false;
-        delete old;
-    }
+    // 常驻主菜单：只有一个实例，进入对局时 hide()，回主菜单时 show()
+    // 如果重复创建，说明是 bug，警告但不 delete 旧实例（泄漏比野指针崩溃好）
+    if (s_liveMenu && s_liveMenu != this)
+        qWarning() << "StartScreen 重复创建，这不应该发生";
     s_liveMenu = this;
 
     setWindowTitle(QStringLiteral("糖果象棋"));
@@ -75,6 +126,49 @@ StartScreen::StartScreen(QWidget *parent)
     // REST 客户端（互联网模式用，QObject 父子关系自动释放）
     m_api = new ApiClient(this);
 
+    // 道具库存/系统邮件：登录后服务器是权威数据源（管理员可经 DataGrip 改）
+    connect(m_api, &ApiClient::inventoryOk, this, [this](int money, int c0, int c1, int c2) {
+        // 首次同步：服务器值为 0 而本地有存货 → 把本地余额先推上去，避免覆盖清零
+        const int lc[4] = { Inventory::money(), Inventory::candyCount(0),
+                            Inventory::candyCount(1), Inventory::candyCount(2) };
+        const int sv[4] = { money, c0, c1, c2 };
+        const char *keys[4] = { "money", "candy0", "candy1", "candy2" };
+        for (int i = 0; i < 4; ++i) {
+            if (sv[i] == 0 && lc[i] > 0 && !m_accessToken.isEmpty()
+                    && Inventory::ownerId() == m_currentUser.id)
+                m_api->pushInventory(m_accessToken, QLatin1String(keys[i]), lc[i]);
+        }
+        Inventory::setFromServer(money, c0, c1, c2);
+    });
+    connect(m_api, &ApiClient::mailsOk, this, [this](const QList<MailInfo> &mails) {
+        int unread = 0;
+        for (const MailInfo &m : mails)
+            if (!m.claimed)
+                ++unread;
+        m_serverMailUnread = unread;
+        refreshBadges();
+    });
+    connect(m_api, &ApiClient::mailClaimOk, this,
+            [this](int mailId, int money, int c0, int c1, int c2) {
+        Q_UNUSED(mailId);
+        Inventory::setFromServer(money, c0, c1, c2);
+        if (m_serverMailUnread > 0)
+            --m_serverMailUnread;
+        refreshBadges();
+    });
+    // 邀请弹窗头像：下载完成回填缓存，并热更新正在显示的邀请框（url 匹配）
+    connect(m_api, &ApiClient::avatarDownloaded, this,
+            [this](const QString &url, const QPixmap &pm) {
+        if (!pm.isNull())
+            m_inviteAvatarCache.insert(url, pm);
+        auto it = m_inviteBoxByUrl.find(url);
+        if (it != m_inviteBoxByUrl.end()) {
+            if (*it && !pm.isNull())
+                (*it)->setIconPixmap(inviteAvatar(pm));
+            m_inviteBoxByUrl.erase(it);
+        }
+    });
+
     m_stack = new QStackedWidget(this);
     auto *root = new QVBoxLayout(this);
     root->setContentsMargins(52, 26, 52, 22);
@@ -83,7 +177,7 @@ StartScreen::StartScreen(QWidget *parent)
     // ===== 第0页：主菜单 =====
     auto *menu = new QWidget();
     auto *menuLayout = new QVBoxLayout(menu);
-    auto *title = new QLabel(QStringLiteral("糖果象棋3.2"), menu);
+    auto *title = new QLabel(QStringLiteral("糖果象棋3.3"), menu);
     title->setAlignment(Qt::AlignCenter);
     QFont f = title->font();
     f.setPointSize(28);
@@ -209,7 +303,7 @@ StartScreen::StartScreen(QWidget *parent)
     aboutBtn->setStyleSheet(QStringLiteral("font-size:13px;color:#888;"));
     connect(aboutBtn, &QPushButton::clicked, this, [this]() {
         QMessageBox::information(this, QStringLiteral("制作者说明"),
-                                 QStringLiteral("因为作者是个穷比没钱租云服务器，所以只能搞内网穿透.翻译成大白话就是只有我电脑开着作为隧道连接后端你们互联网联机功能才能用，其他情况用用局域网得了.局域网要求两个电脑连同一个无线网，最好不要是校园网，用手机开热点，把梯子也关掉"));
+                                 QStringLiteral("服务器已经部署在云端啦，全天24小时在线，随时打开游戏都能互联网联机，再也不用担心联机功能用不了~局域网联机要求两台电脑连同一个无线网，最好不要是校园网，用手机开热点也可以"));
     });
     cornerRow->addWidget(aboutBtn);
     menuLayout->addLayout(cornerRow);
@@ -323,8 +417,10 @@ StartScreen::StartScreen(QWidget *parent)
         dlg.exec();
     });
     connect(m_mailBtn, &QPushButton::clicked, this, [this]() {
-        MailDialog dlg(this);
+        MailDialog dlg(this, m_api, m_accessToken);
         dlg.exec();
+        if (!m_accessToken.isEmpty())
+            m_api->listMails(m_accessToken);  // 领取状态可能变化，重拉红点
         refreshBadges();
     });
     connect(endgameBtn, &QPushButton::clicked, this, &StartScreen::onPickEndgame);
@@ -346,6 +442,45 @@ StartScreen::StartScreen(QWidget *parent)
 
 void StartScreen::bootstrapAuth()
 {
+    // 机器人模式：账号密码直连登录（不走注册表 refresh token——双开实例共享注册表会串号），
+    // 失败 6 秒后自动重试；红方登录成功后启动邀请定时器
+    if (s_botMode) {
+        auto *cOk = new QMetaObject::Connection;
+        *cOk = connect(m_api, &ApiClient::loginOk, this,
+                       [this, cOk](const UserInfo &u, const QString &at, const QString &) {
+            disconnect(*cOk);
+            delete cOk;
+            m_currentUser = u;
+            m_accessToken = at;
+            enterMenu();
+            const bool slowInvite = (s_botRole == QLatin1String("slowred"));
+            if (s_botRole == QLatin1String("red") || slowInvite) {
+                m_botTimer = new QTimer(this);
+                connect(m_botTimer, &QTimer::timeout, this, &StartScreen::botTick);
+                if (slowInvite) {
+                    // 邀约机器人：慢节奏邀请真人对弈（首发 1.5~3 分钟，之后 4~10 分钟）
+                    const int firstMs = 90000 + QRandomGenerator::global()->bounded(90000);
+                    const int periodMs = 240000 + QRandomGenerator::global()->bounded(360000);
+                    m_botTimer->start(periodMs);
+                    QTimer::singleShot(firstMs, this, &StartScreen::botTick);
+                } else {
+                    m_botTimer->start(12000);
+                    QTimer::singleShot(5000, this, &StartScreen::botTick);
+                }
+            }
+        });
+        auto *cErr = new QMetaObject::Connection;
+        *cErr = connect(m_api, &ApiClient::errorOccurred, this,
+                        [this, cOk, cErr](const QString &err) {
+            disconnect(*cOk); disconnect(*cErr);
+            delete cOk; delete cErr;
+            qWarning() << "[bot] login failed:" << err;
+            QTimer::singleShot(6000, this, [this]() { bootstrapAuth(); });
+        });
+        m_api->login(s_botUser, s_botPass);
+        return;
+    }
+
     const QString rt = ApiClient::loadRefreshToken();
     // 没地址时不做自动登录尝试，直接弹登录框让玩家先填服务器地址
     if (rt.isEmpty() || !ServerConfig::isConfigured()) {
@@ -393,6 +528,7 @@ void StartScreen::showForcedLogin()
 
 void StartScreen::enterMenu()
 {
+    MainWindow::s_localName = m_currentUser.display_name;  // 观战语音按昵称过滤用
     // 填充用户条
     m_userName->setText(m_currentUser.display_name);
     m_userName->setStyleSheet(QStringLiteral("font-size:16px;font-weight:bold;"));
@@ -434,12 +570,42 @@ void StartScreen::enterMenu()
     m_stack->setCurrentIndex(0);
     refreshBadges();
 
+    // 道具同步：本地变动增量上报 + 拉取服务器权威库存与系统邮件
+    // 先标记归属：换账号（含游客）登录清空本地缓存，防止继承上一账号金币
+    Inventory::setOwner(m_currentUser.id);
+    Inventory::setSyncHook([this](const QString &key, int delta) {
+        if (m_accessToken.isEmpty())
+            return;
+        m_api->pushInventory(m_accessToken, key, delta);
+    });
+    if (!m_accessToken.isEmpty()) {
+        m_api->fetchInventory(m_accessToken);
+        m_api->listMails(m_accessToken);
+    }
+
     // 登录态建立后立即常连实时通道：回主菜单、进对局期间都保持在线
     ensureInternet();
 }
 
+StartScreen::~StartScreen()
+{
+    // 钩子捕获了 this：实例销毁（对局结束被新主菜单替换）前必须清掉，防悬空
+    Inventory::setSyncHook({});
+    // 观战窗没有父窗口不会被级联销毁，先收摊再走
+    // （silentClose：析构中不能触发 closeEvent 的 new StartScreen，否则链式创建/删除主菜单）
+    if (m_spectateGame) {
+        MainWindow *spec = m_spectateGame;
+        m_spectateGame = nullptr;
+        spec->setSilentClose(true);
+        spec->close();
+        spec->deleteLater();
+    }
+}
+
 void StartScreen::onLogout()
 {
+    Inventory::setSyncHook({});
+    m_serverMailUnread = 0;
     if (!m_refreshToken.isEmpty())
         m_api->logout(m_refreshToken);  // 不阻塞等待响应
     ApiClient::clearRefreshToken();
@@ -483,6 +649,9 @@ void StartScreen::ensureInternet()
                 this, &StartScreen::onGlobalInviteDeclined, Qt::UniqueConnection);
         connect(m_internet, &InternetClient::matchReady,
                 this, &StartScreen::onInternetMatched, Qt::UniqueConnection);
+        // 「正在对局」列表点观战：服务器确认后打开实时观战窗
+        connect(m_internet, &InternetClient::spectateStarted,
+                this, &StartScreen::onSpectateStarted, Qt::UniqueConnection);
         // lambda 不能用 Qt::UniqueConnection（connect 会直接失败），创建分支内只连一次无需去重
         connect(m_internet, &InternetClient::socketClosed, this, [this]() {
             onInternetClosed();
@@ -608,7 +777,7 @@ void StartScreen::onInternetMode()
     }
     if (!ServerConfig::isConfigured()) {
         QMessageBox::information(this, QStringLiteral("服务器地址"),
-                                 QStringLiteral("请先点左下角「🌐 服务器」填写房主提供的地址"));
+                                 QStringLiteral("请先点左下角「服务器」填写房主提供的地址"));
         onEditServerUrl();
         if (!ServerConfig::isConfigured())
             return;
@@ -623,11 +792,11 @@ void StartScreen::onFriends()
     openFriendsPage(false);
 }
 
-// 红点：邮件=新手礼包未领；好友=主菜单期间未读私信/礼物/好友请求数
+// 红点：邮件=新手礼包未领或服务端未领系统邮件；好友=主菜单期间未读私信/礼物/好友请求数
 void StartScreen::refreshBadges()
 {
     if (m_mailBadge)
-        m_mailBadge->setVisible(!MailDialog::welcomeClaimed());
+        m_mailBadge->setVisible(!MailDialog::welcomeClaimed() || m_serverMailUnread > 0);
 
     const int unread = QSettings().value(QStringLiteral("friendsUnread"), 0).toInt();
     if (m_friendsBadge) {
@@ -688,7 +857,7 @@ void StartScreen::openFriendsPage(bool allowInvite)
 {
     if (!ServerConfig::isConfigured()) {
         QMessageBox::information(this, QStringLiteral("服务器地址"),
-                                 QStringLiteral("请先点左下角「🌐 服务器」填写房主提供的地址"));
+                                 QStringLiteral("请先点左下角「服务器」填写房主提供的地址"));
         onEditServerUrl();
         if (!ServerConfig::isConfigured())
             return;
@@ -718,6 +887,13 @@ void StartScreen::openFriendsPage(bool allowInvite)
     connect(m_internet, &InternetClient::helloReceived,
             m_friendsPage, &FriendsPanel::start);
     // matchReady 已在 ensureInternet 全局连接：邀请在任意页面接受都能直接进对局
+    // 「正在对局」列表双击/观战按钮 → 加入该房间观战频道
+    connect(m_friendsPage, &FriendsPanel::spectateRequested, this,
+            [this](const QString &roomId) {
+        ensureInternet();
+        if (m_internet && m_internet->isOpen())
+            m_internet->spectateJoin(roomId);
+    });
 
     m_stack->setCurrentIndex(pageIdx);
     // WS 可能在进页面之前就完成握手了：直接先拉一次，hello 后还会再刷
@@ -748,27 +924,54 @@ void StartScreen::onInternetLogoutCleanup()
 }
 
 // 收到对战邀请：任意页面弹窗应答；关掉/未答前红点亮着，可从「互联网对战」按钮重提
-void StartScreen::onGlobalInvite(int fromUserId, const QString &fromName)
+void StartScreen::onGlobalInvite(int fromUserId, const QString &fromName,
+                                 const QString &fromAvatar)
 {
+    // 机器人：直接接受，不弹窗不记红点（黑方机器人全靠这条路径进局）
+    if (s_botMode) {
+        if (m_internet && m_internet->isOpen())
+            m_internet->respondInvite(fromUserId, true);
+        return;
+    }
     m_pendingInvites.insert(fromUserId);
     m_pendingInviteNames.insert(fromUserId, fromName);
+    m_pendingInviteAvatars.insert(fromUserId, fromAvatar);
     refreshBadges();
+    // 对局中不弹窗：红点排队，回菜单后点「互联网对战」按钮处理
+    if (qobject_cast<MainWindow*>(QApplication::activeWindow()))
+        return;
     promptInvite(fromUserId);
 }
 
 void StartScreen::promptInvite(int fromUserId)
 {
     const QString name = m_pendingInviteNames.value(fromUserId);
+    const QString avatar = m_pendingInviteAvatars.value(fromUserId);
     // 父窗口用当前激活窗口：好友停在主菜单/其他页面/对局中，弹窗都跟到哪
     QWidget *parent = QApplication::activeWindow();
     if (!parent)
         parent = this;
-    const auto ret = QMessageBox::question(
-        parent, QStringLiteral("对战邀请"),
-        QStringLiteral("%1 邀请你进行互联网对战，是否接受？").arg(name),
-        QMessageBox::Yes | QMessageBox::No);
+    QMessageBox box(QMessageBox::Question, QStringLiteral("对战邀请"),
+                    QStringLiteral("%1 邀请你进行互联网对战，是否接受？").arg(name),
+                    QMessageBox::Yes | QMessageBox::No, parent);
+    // 头像：有 URL 先下载（缓存秒回填），完成前用彩色首字圆底占位，下载完热更新
+    const QString full = avatar.isEmpty() ? QString() : ServerConfig::serverUrl() + avatar;
+    QPixmap pm;
+    if (!full.isEmpty()) {
+        if (m_inviteAvatarCache.contains(full)) {
+            pm = inviteAvatar(m_inviteAvatarCache.value(full));
+        } else {
+            m_inviteBoxByUrl.insert(full, &box);
+            m_api->downloadAvatar(full);
+        }
+    }
+    if (pm.isNull())
+        pm = coloredAvatar(name, fromUserId);
+    box.setIconPixmap(pm);
+    const auto ret = box.exec();
     m_pendingInvites.remove(fromUserId);
     m_pendingInviteNames.remove(fromUserId);
+    m_pendingInviteAvatars.remove(fromUserId);
     refreshBadges();
     if (m_internet && m_internet->isOpen())
         m_internet->respondInvite(fromUserId, ret == QMessageBox::Yes);
@@ -780,6 +983,11 @@ void StartScreen::promptInvite(int fromUserId)
 // 邀请方收到拒绝结果（原来只在好友页提示，现在全局可见）
 void StartScreen::onGlobalInviteDeclined(int)
 {
+    if (s_botMode)
+        return;   // 机器人：对方忙线/拒接很常见，等下个 tick 再邀请，不弹窗
+    // 对局中不弹窗打扰
+    if (qobject_cast<MainWindow*>(QApplication::activeWindow()))
+        return;
     QWidget *parent = QApplication::activeWindow();
     if (!parent)
         parent = this;
@@ -789,7 +997,7 @@ void StartScreen::onGlobalInviteDeclined(int)
 
 // 主菜单/对局中收到私信：好友页不在前台时弹出独立聊天窗
 void StartScreen::onGlobalDm(int fromUserId, const QString &fromName,
-                             const QString &text)
+                             const QString &fromAvatar, const QString &text)
 {
     // 好友页打开着：它自己的 onDmReceived 会处理，避免重复弹窗
     if (m_friendsPage && m_stack->currentWidget() == m_friendsPage)
@@ -801,9 +1009,19 @@ void StartScreen::onGlobalDm(int fromUserId, const QString &fromName,
                     st.value(QStringLiteral("friendsUnread"), 0).toInt() + 1);
         refreshBadges();
     }
+    // 对局中（计数判定，activeWindow 在安卓/瞬态窗口下不可靠）：不弹独立聊天窗，
+    // 消息写入聊天窗缓存（不 show），红点已 +1，回菜单后打开可见
+    const bool inGame = MainWindow::gameWindowOpen()
+                        || qobject_cast<MainWindow*>(QApplication::activeWindow());
     ChatDialog *dlg = m_globalChats.value(fromUserId, nullptr);
     if (!dlg) {
-        dlg = new ChatDialog(m_internet, fromUserId, fromName, this);
+        // 头像：好友页缓存优先，服务器 dm 自带的 from_avatar 兜底（好友页没开过也有头像）
+        QString avatar = m_friendsPage ? m_friendsPage->friendAvatarUrl(fromUserId)
+                                       : QString();
+        if (avatar.isEmpty())
+            avatar = fromAvatar;
+        dlg = new ChatDialog(m_internet, m_currentUser.id, fromUserId, fromName, this,
+                             avatar, m_api);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         connect(dlg, &QObject::destroyed, this, [this, fromUserId]() {
             m_globalChats.remove(fromUserId);
@@ -812,6 +1030,8 @@ void StartScreen::onGlobalDm(int fromUserId, const QString &fromName,
     }
     if (!text.isEmpty())
         dlg->receiveMessage(fromName, text);
+    if (inGame)
+        return;   // 对局中只缓存不贴脸
     dlg->show();
     dlg->raise();
     dlg->activateWindow();
@@ -831,6 +1051,9 @@ void StartScreen::onGlobalGift(int fromUserId, const QString &fromName,
     st.setValue(QStringLiteral("friendsUnread"),
                 st.value(QStringLiteral("friendsUnread"), 0).toInt() + 1);
     refreshBadges();
+    // 对局中不弹窗打扰
+    if (qobject_cast<MainWindow*>(QApplication::activeWindow()))
+        return;
     QMessageBox box(this);
     box.setWindowTitle(QStringLiteral("收到礼物"));
     box.setTextFormat(Qt::RichText);
@@ -838,7 +1061,7 @@ void StartScreen::onGlobalGift(int fromUserId, const QString &fromName,
                     "<div align='center'>"
                     "<span style='font-size:46px;'>%1</span><br>"
                     "<b style='font-size:16px;'>%2</b> 送你一份%3<br>"
-                    "<span style='color:#888;'>已放入背包，去「🎒 背包」查看吧</span>"
+                    "<span style='color:#888;'>已放入背包，去「背包」查看吧</span>"
                     "</div>")
                     .arg(g.emoji.toHtmlEscaped(),
                          fromName.toHtmlEscaped(),
@@ -878,6 +1101,23 @@ void StartScreen::onInternetMatched(const QString &roomId, const QString &side,
                                     const UserInfo &opp)
 {
     Q_UNUSED(roomId)
+    // 先收摊观战窗：两个 NetworkManager 同时桥接同一 WS 会互相串信号
+    // （silentClose：本函数还在堆栈上，不能让 closeEvent new StartScreen 把 this 给 delete 了）
+    if (m_spectateGame) {
+        MainWindow *spec = m_spectateGame;
+        m_spectateGame = nullptr;
+        spec->setSilentClose(true);
+        spec->close();
+        spec->deleteLater();
+    }
+    // 机器人：旧对局窗还挂着（对方掉线等残留）先拆掉，否则两个窗桥同一 WS 信号互吃、restart 握手永远完不成
+    if (m_game) {
+        MainWindow *old = m_game;
+        m_game = nullptr;
+        old->setSilentClose(true);
+        old->close();
+        old->deleteLater();
+    }
     NetworkManager *net = new NetworkManager(this);
     net->attachInternet(m_internet);
     const bool isHost = (side == QLatin1String("red"));
@@ -893,11 +1133,90 @@ void StartScreen::onInternetMatched(const QString &roomId, const QString &side,
     m_game = new MainWindow(MainWindow::GameMode::Online, isHost, net, isHost,
                             false, -1, 0, selfCard(), oppCard);
     net->setParent(m_game);
-    m_game->show();
-    m_game->raise();
-    m_game->activateWindow();
+    // 机器人：最小化窗口防抢焦点，1.5 秒后直接进入挂机代打（跳过召唤动画）
+    if (s_botMode) {
+        m_game->setBotPlay(true);   // 激活全部机器人分支：音效/语音不加载不播放、终局自动退进程
+        m_game->showMinimized();
+        QTimer::singleShot(1500, m_game, &MainWindow::enableBotAfk);
+    } else {
+        m_game->show();
+        m_game->raise();
+        m_game->activateWindow();
+    }
     // 注意：不关闭主菜单（也不 close WS）——隐藏在后面保持实时通道常连，
     // 对局结束回到的新主菜单会接管并自动重连
+}
+
+// 「正在对局」列表点观战：服务器确认后打开实时观战窗（看棋 + 看双方和观众聊天）
+void StartScreen::onSpectateStarted(const QString &roomId, const UserInfo &red,
+                                    const UserInfo &black, const QJsonArray &moves)
+{
+    Q_UNUSED(roomId)
+    if (m_game)
+        return;   // 自己正在对局：不观战（不能两个 NetworkManager 抢同一 WS）
+    // 换房观战：先关旧观战窗（silentClose：避免 closeEvent new StartScreen 干扰当前流程）
+    if (m_spectateGame) {
+        MainWindow *old = m_spectateGame;
+        m_spectateGame = nullptr;
+        old->setSilentClose(true);
+        old->close();
+        old->deleteLater();
+    }
+    NetworkManager *net = new NetworkManager(this);
+    net->attachInternet(m_internet);
+    net->setSpectator(true);
+
+    PlayerCardInfo redCard, blackCard;
+    redCard.valid = true;
+    redCard.name = red.display_name.isEmpty() ? red.username : red.display_name;
+    redCard.title = red.title;
+    redCard.avatarUrl = red.avatar_url;
+    redCard.avatarSeed = red.id;
+    blackCard.valid = true;
+    blackCard.name = black.display_name.isEmpty() ? black.username : black.display_name;
+    blackCard.title = black.title;
+    blackCard.avatarUrl = black.avatar_url;
+    blackCard.avatarSeed = black.id;
+
+    m_spectateGame = new MainWindow(MainWindow::GameMode::Online, false, net, true,
+                                    true, -1, 0, redCard, blackCard);
+    net->setParent(m_spectateGame);
+    m_spectateGame->replayMoves(moves);   // 中途加入：按服务器着法历史快放到当前局面
+    m_spectateGame->show();
+    m_spectateGame->raise();
+}
+
+// 机器人红方：没在对局且 WS 在线就向 oppId 发对战邀请（对方忙线/拒绝则下轮再试）
+// oppId=0 的邀约机器人：拉取 /api/bot/targets 在线真人列表，随机邀请一个
+void StartScreen::botTick()
+{
+    if (!s_botMode || m_game || m_accessToken.isEmpty())
+        return;
+    const bool slowInvite = (s_botRole == QLatin1String("slowred"));
+    if (s_botRole != QLatin1String("red") && !slowInvite)
+        return;   // 黑方机器人只等待邀请
+    if (!m_internet || !m_internet->isOpen()) {
+        ensureInternet();
+        return;   // WS 还没握手完，下个 tick 再发
+    }
+    if (slowInvite && s_botOppId.toInt() == 0) {
+        if (m_botTargetFetching) return;   // 上次请求未回，等下个 tick
+        m_botTargetFetching = true;
+        auto *conn = new QMetaObject::Connection;
+        *conn = connect(m_api, &ApiClient::botTargetsOk, this,
+                        [this, conn](const QList<int> &targets) {
+            disconnect(*conn);
+            delete conn;
+            m_botTargetFetching = false;
+            if (targets.isEmpty() || m_game || !m_internet || !m_internet->isOpen())
+                return;
+            const int to = targets[QRandomGenerator::global()->bounded(targets.size())];
+            m_internet->invite(to);
+        });
+        m_api->fetchBotTargets(m_accessToken);
+        return;
+    }
+    m_internet->invite(s_botOppId.toInt());
 }
 
 // ===================== 单机 / 局域网 =====================
@@ -1002,8 +1321,8 @@ void StartScreen::onPickEndgame()
             [goalLbl, hintLbl](int row) {
         if (row < 0) return;
         const EndgameInfo &info = endgameInfo(row);
-        goalLbl->setText(QStringLiteral("🎯 目标：%1").arg(QString::fromUtf8(info.goal)));
-        hintLbl->setText(QStringLiteral("💡 提示：%1").arg(QString::fromUtf8(info.hint)));
+        goalLbl->setText(QStringLiteral("目标：%1").arg(QString::fromUtf8(info.goal)));
+        hintLbl->setText(QStringLiteral("提示：%1").arg(QString::fromUtf8(info.hint)));
     });
     connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
     connect(startBtn, &QPushButton::clicked, &dlg, &QDialog::accept);

@@ -12,6 +12,41 @@ static const QString kMoney = QStringLiteral("money");
 static const QString kGifts = QStringLiteral("giftsLog");
 static const int MAX_GIFTS = 300;
 
+// 本地变动 → 服务器增量上报钩子（登录后注入；未登录为空）
+static std::function<void(const QString &key, int delta)> s_sync;
+
+void setSyncHook(const std::function<void(const QString &key, int delta)> &fn)
+{
+    s_sync = fn;
+}
+
+void setFromServer(int money, int candy0, int candy1, int candy2)
+{
+    QSettings st;
+    st.setValue(kMoney, money);
+    st.setValue(QStringLiteral("candy0"), candy0);
+    st.setValue(QStringLiteral("candy1"), candy1);
+    st.setValue(QStringLiteral("candy2"), candy2);
+}
+
+void setOwner(int userId)
+{
+    QSettings st;
+    static const QString kOwner = QStringLiteral("invOwner");
+    if (st.value(kOwner, 0).toInt() == userId)
+        return;
+    st.setValue(kOwner, userId);
+    // 换账号登录：清空本地货币/糖果缓存，防止游客等新账号继承上一账号的余额
+    st.setValue(kMoney, 0);
+    for (int i = 0; i < 3; ++i)
+        st.setValue(QStringLiteral("candy%1").arg(i), 0);
+}
+
+int ownerId()
+{
+    return QSettings().value(QStringLiteral("invOwner"), 0).toInt();
+}
+
 int money()
 {
     return QSettings().value(kMoney, 0).toInt();
@@ -21,6 +56,7 @@ void addMoney(int delta)
 {
     QSettings st;
     st.setValue(kMoney, st.value(kMoney, 0).toInt() + delta);
+    if (s_sync) s_sync(kMoney, delta);
 }
 
 bool spendMoney(int cost)
@@ -30,6 +66,7 @@ bool spendMoney(int cost)
     if (cur < cost)
         return false;
     st.setValue(kMoney, cur - cost);
+    if (s_sync) s_sync(kMoney, -cost);
     return true;
 }
 
@@ -43,6 +80,7 @@ void addCandy(int idx, int n)
     QSettings st;
     const QString key = QStringLiteral("candy%1").arg(idx);
     st.setValue(key, st.value(key, 0).toInt() + n);
+    if (s_sync) s_sync(key, n);
 }
 
 int itemCount(const QString &key)
@@ -75,7 +113,7 @@ void addGift(const QString &from, const QString &rawText)
     }
     // 去掉固定句式 "送你一份" 和结尾叹号
     name.remove(QStringLiteral("送你一份"));
-    if (name.endsWith(QLatin1Char('！')) || name.endsWith(QLatin1Char('!')))
+    if (name.endsWith(u'！') || name.endsWith(QLatin1Char('!')))
         name.chop(1);
     name = name.trimmed();
     if (name.isEmpty())

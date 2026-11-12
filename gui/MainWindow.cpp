@@ -3,6 +3,7 @@
 #include "NetworkManager.h"
 #include "StickerPicker.h"
 #include "StartScreen.h"
+#include "ChatDialog.h"
 #include "ServerConfig.h"
 #include "Achievements.h"
 
@@ -40,6 +41,7 @@
 #include <QRadialGradient>
 #include <QRandomGenerator>
 #include <QRectF>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QShowEvent>
 #include <QSize>
@@ -47,6 +49,8 @@
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QSoundEffect>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QTextEdit>
 #include <QThread>
 #include <QUrl>
@@ -296,6 +300,15 @@ MainWindow::MainWindow(GameMode mode, bool isHost, NetworkManager *net,
       m_playerRed(playerRed), m_isSpectator(isSpectator),
       m_endgameIdx(endgameIdx), m_mode(mode), m_isHost(isHost), m_net(net)
 {
+    ++s_openGameWindows;   // 对局/观战窗打开：期间收到的私信只入缓存不弹窗
+    m_openCounted = true;
+    // 进对局前可能正开着私信聊天窗：顺手隐藏（不关闭，聊天记录保留），避免挡棋盘
+    for (QWidget *w : QApplication::topLevelWidgets()) {
+        if (auto *dlg = qobject_cast<ChatDialog*>(w)) {
+            if (dlg->isVisible())
+                dlg->hide();
+        }
+    }
     // 联机模式：playerRed 由调用方传入（随机红黑方或互联网匹配结果）
     if (m_mode == GameMode::Online) {
         m_myTurn = m_playerRed;   // 红方先走
@@ -585,11 +598,28 @@ MainWindow::MainWindow(GameMode mode, bool isHost, NetworkManager *net,
         m_view->update();
     });
 
+    // 落子滑动动画驱动：60fps，播满 kMoveAnimFrames 帧自动停
+    m_moveAnimTimer = new QTimer(this);
+    m_moveAnimTimer->setInterval(16);
+    connect(m_moveAnimTimer, &QTimer::timeout, this, [this] {
+        if (++m_moveAnimFrame >= kMoveAnimFrames) {
+            m_moveAnimTimer->stop();
+            m_moveAnimActive = false;
+        }
+        if (m_view)
+            m_view->update();
+    });
+
     // AI 思考计时显示（AI 在后台线程，界面持续响应）
     m_thinkTimer = new QTimer(this);
     m_thinkTimer->setInterval(100);
     connect(m_thinkTimer, &QTimer::timeout, this, &MainWindow::onAiTick);
     m_thinkClock = new QElapsedTimer();
+
+    // 挂机走子延时触发：单次定时器，start() 会重启已有计时，避免 singleShot 堆叠多个
+    m_afkTimer = new QTimer(this);
+    m_afkTimer->setSingleShot(true);
+    connect(m_afkTimer, &QTimer::timeout, this, &MainWindow::startAfkMove);
 
     initSounds();   // 只创建音效对象；资源加载延后（见下）
     // 音频后端初始化（setSource）是同步耗时操作，9 个音效连着做会明显拖慢
@@ -730,13 +760,18 @@ MainWindow::MainWindow(GameMode mode, bool isHost, NetworkManager *net,
             connect(m_net, &NetworkManager::disconnected, this, &MainWindow::onPeerDisconnected);
             connect(m_net, &NetworkManager::profileReceived,
                     this, &MainWindow::onNetworkProfile);
+            connect(m_net, &NetworkManager::specChatReceived, this, &MainWindow::onSpecChatReceived);
+            connect(m_net, &NetworkManager::gameEndReceived, this, &MainWindow::onGameEndReceived);
         }
 
         // 版本握手：双方窗口都建好后再互报版本（延迟一点，保证对方已挂上信号）
-        QTimer::singleShot(800, this, [this]() {
-            if (m_net)
-                m_net->sendVersion(QStringLiteral("3.2.0"));
-        });
+        // 观战者不发——服务器 version 属对局事件，观战者不在房间会弹"你不在任何房间中"
+        if (!m_isSpectator) {
+            QTimer::singleShot(800, this, [this]() {
+                if (m_net)
+                    m_net->sendVersion(QStringLiteral("3.3.0"));
+            });
+        }
 
         // 局域网名片握手：互报昵称/头衔/头像（互联网模式 sendProfile 内部为空操作，
         // 对手信息由 match_ready 携带）；观战者不发自己的名片
@@ -760,7 +795,9 @@ MainWindow::MainWindow(GameMode mode, bool isHost, NetworkManager *net,
     // ===== 名片初始填充 =====
     // 红方名片在棋盘下，黑方名片在棋盘上（与本机执子视角无关，双方看到的位置一致）
     if (m_isSpectator) {
-        // 观战：两个对局者都等 PROFILE，先留占位
+        // 观战：构造参数 self=红方名片、opponent=黑方名片，立即填（红下黑上）
+        applySideProfile(true, m_selfInfo);
+        applySideProfile(false, m_oppInfo);
     } else if (m_mode == GameMode::SinglePlayer) {
         // 人机：自己 + 糖果AI（残局挑战无对面 AI，只显示自己，对面留占位）
         if (m_endgameIdx < 0) {
@@ -774,21 +811,24 @@ MainWindow::MainWindow(GameMode mode, bool isHost, NetworkManager *net,
                 ai.title = QStringLiteral("人工智能");
                 ai.avatarSeed = 888 + idx;
             }
-            applySideProfile(m_playerRed, m_selfInfo);
-            applySideProfile(!m_playerRed, ai);
+            // 本机视角：自己名片永远在棋盘下，对手在棋盘上
+            fillCardPos(true, m_selfInfo, m_playerRed);
+            fillCardPos(false, ai, !m_playerRed);
         } else {
-            applySideProfile(m_playerRed, m_selfInfo);
+            fillCardPos(true, m_selfInfo, m_playerRed);
         }
     } else {
-        // 联机：自己立即显示；互联网对手 match_ready 已带，局域网对手等 PROFILE
-        applySideProfile(m_playerRed, m_selfInfo);
+        // 联机：自己名片永远在棋盘下；互联网对手 match_ready 已带，局域网对手等 PROFILE
+        fillCardPos(true, m_selfInfo, m_playerRed);
         if (m_oppInfo.valid)
-            applySideProfile(!m_playerRed, m_oppInfo);
+            fillCardPos(false, m_oppInfo, !m_playerRed);
     }
 }
 
 MainWindow::~MainWindow()
 {
+    if (m_openCounted)
+        --s_openGameWindows;   // 正常在 closeEvent 里已减；未走 close 的删除路径兜底
     // 关窗口时 AI 还在算就等它结束，避免线程访问已销毁对象
     if (m_aiThread && m_aiThread->isRunning())
         m_aiThread->wait();
@@ -896,9 +936,11 @@ void MainWindow::buildPlayerCards(QWidget *parent, QVBoxLayout *boardCol)
         if (redSide) {
             m_cardBottom = card;
             m_botAvatar = avatar; m_botName = nameLbl; m_botTitle = titleLbl;
+            m_botTag = sideTag;
         } else {
             m_cardTop = card;
             m_topAvatar = avatar; m_topName = nameLbl; m_topTitle = titleLbl;
+            m_topTag = sideTag;
         }
         // 初始占位头像
         avatar->setPixmap(makeDefaultAvatar(
@@ -946,6 +988,29 @@ void MainWindow::fillCard(bool redSide, const PlayerCardInfo &info)
                        : info.name,
                    info.avatarSeed ? info.avatarSeed
                                    : (redSide ? 1 : 2));
+}
+
+// 按位置填名片：本机视角自己永远在棋盘下；卡片底色/阵营标按内容实际执子方重着色
+void MainWindow::fillCardPos(bool bottom, const PlayerCardInfo &info, bool infoRed)
+{
+    if (!info.valid)
+        return;
+    QFrame *card = bottom ? m_cardBottom : m_cardTop;
+    QLabel *tag = bottom ? m_botTag : m_topTag;
+    if (card) {
+        card->setStyleSheet(infoRed
+            ? QStringLiteral("QFrame { background:#fdeeee; border:1px solid #e0a3a3;"
+                             "  border-radius:10px; }")
+            : QStringLiteral("QFrame { background:#eef1f5; border:1px solid #aab4c0;"
+                             "  border-radius:10px; }"));
+    }
+    if (tag) {
+        tag->setText(infoRed ? QStringLiteral("红方") : QStringLiteral("黑方"));
+        tag->setStyleSheet(infoRed
+            ? QStringLiteral("color:#c82622;font-weight:bold;")
+            : QStringLiteral("color:#333;font-weight:bold;"));
+    }
+    fillCard(bottom, info);   // fillCard 的 redSide 实参仅用于选上下排控件
 }
 
 void MainWindow::loadCardAvatar(QLabel *lbl, const QString &url,
@@ -1003,19 +1068,49 @@ void MainWindow::onNetworkProfile(const QString &name, const QString &title,
     info.title = title;
     info.avatarUrl = avatarUrl;
     info.avatarSeed = qHash(name) & 0x7fffffff;
-    applySideProfile(senderRed, info);
+    // 观战保持红下黑上；对局者视角对方永远在棋盘上
+    if (m_isSpectator)
+        applySideProfile(senderRed, info);
+    else
+        fillCardPos(false, info, senderRed);
 }
 
 // 关闭对局窗口：互联网模式通知服务器离开房间（对方会收到断线提示并释放房间）
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-    if (m_mode == GameMode::Online && m_net)
-        m_net->leaveRoom();
+    if (m_mode == GameMode::Online && m_net) {
+        if (m_isSpectator)
+            m_net->sendSpectateLeave();   // 观战：退出观战频道
+        else
+            m_net->leaveRoom();
+    }
     QMainWindow::closeEvent(event);
-    // 所有开局路径都会关掉主菜单窗口，这里重新拉起一个，关对局=回主菜单而不是退出程序
-    // （新主菜单自动用注册表里的登录态，无需重新登录）
-    auto *menu = new StartScreen;
-    menu->show();
+    // 窗口只关不删（对象由 StartScreen 持有）：计数必须在这里减，否则对局判定卡死
+    if (m_openCounted) {
+        --s_openGameWindows;
+        m_openCounted = false;
+    }
+    // 机器人：进程直接退出，由编排脚本重启进入下一局
+    // （机器人双开共享注册表，重复 new StartScreen 会串登录态，直接退出最干净）
+    if (m_botPlay) {
+        qApp->exit(0);
+        return;
+    }
+    // 程序内部清理（onInternetMatched/onSpectateStarted 收摊旧窗）：不拉起新主菜单，
+    // 否则 closeEvent 里 new StartScreen 会 delete 掉正在堆栈上执行的主菜单实例（野指针崩溃）
+    if (m_silentClose)
+        return;
+    // 回主菜单：复用常驻的 StartScreen 实例，而不是 new 新的
+    // （new 会触发构造函数 delete 旧实例，若旧实例在堆栈上执行就是野指针崩溃）
+    if (StartScreen::s_liveMenu) {
+        StartScreen::s_liveMenu->show();
+        StartScreen::s_liveMenu->raise();
+        StartScreen::s_liveMenu->activateWindow();
+    } else {
+        // 兜底：主菜单不存在时才创建（理论上不应该发生）
+        auto *menu = new StartScreen;
+        menu->show();
+    }
 }
 
 // 返回主菜单：closeEvent 会重新拉起主菜单；联机对局未结束先确认，防误触断线
@@ -1041,6 +1136,9 @@ void MainWindow::ensureMusicPlayer()
         return;
     m_audioOut = new QAudioOutput(this);
     m_audioOut->setVolume(m_volSlider ? m_volSlider->value() / 100.0f : 0.5f);
+    // 机器人后台运行：背景音乐输出整体静音（双保险，bot 本无音乐交互）
+    if (m_botPlay)
+        m_audioOut->setMuted(true);
     m_musicPlayer = new QMediaPlayer(this);
     m_musicPlayer->setAudioOutput(m_audioOut);
     m_musicPlayer->setLoops(QMediaPlayer::Infinite);
@@ -1071,6 +1169,9 @@ void MainWindow::initSounds()
 // （玩家最快也要几百毫秒后才落第一子，此时早已加载完毕，听感无差异）
 void MainWindow::loadSoundSources()
 {
+    // 机器人后台运行不外放声音：不绑定资源，play() 变空操作
+    if (m_botPlay)
+        return;
     m_sndSelect->setSource(QUrl(QStringLiteral("qrc:/sounds/select.wav")));
     m_sndMove->setSource(QUrl(QStringLiteral("qrc:/sounds/move.wav")));
     m_sndCapture->setSource(QUrl(QStringLiteral("qrc:/sounds/capture.wav")));
@@ -1332,6 +1433,8 @@ void MainWindow::restartGame()
     m_endgameMoves = 0;   // 残局：重开重置步数统计
     clearSelection();
     m_hasLast = false;
+    m_moveAnimActive = false;   // 清掉进行中的落子动画，避免新局残留滑动棋子
+    m_moveAnimTimer->stop();
     m_gameOver = false;
     m_moneySettled = false;   // 新一局：允许再次结算货币
     m_aiThinking = false;
@@ -1385,6 +1488,8 @@ void MainWindow::undoMove()
 
     m_gameOver = false;
     clearSelection();
+    m_moveAnimActive = false;   // 悔棋后棋盘回退，停掉滑动动画
+    m_moveAnimTimer->stop();
     m_avatarTimer->stop();
     setAvatar(AvatarState::Idle);
     if (m_history.empty()) {
@@ -1443,6 +1548,8 @@ void MainWindow::endgameMaybeRetry(const QString &reason)
 // 胜利成就：残局通关/击败奶娃(人机)/互联网取胜，外加杀法称号；解锁弹窗
 void MainWindow::reportWinAchievements(const QString &killName)
 {
+    if (m_botPlay)
+        return;   // 机器人不打成就、不弹解锁窗
     QStringList notices;
     if (m_endgameIdx >= 0) {
         notices += Achievements::recordEvent(QStringLiteral("endgame"), 1);
@@ -1605,6 +1712,7 @@ void MainWindow::onCandyFinished()
     m_history.push_back(s);
     m_last = mv;
     m_hasLast = true;
+    animateMove(mv);   // 落子动画：代走这步滑动
 
     // ---- 长将/重复局面检测：代走犯规算我方输 ----
     {
@@ -2033,6 +2141,7 @@ void MainWindow::onAiFinished()
     m_history.push_back(aiStep);
     m_last = ai;
     m_hasLast = true;
+    animateMove(ai);   // 落子动画：AI 这步滑动
     // AI 落子：对面吃子用对面音效，普通走动用木质落子声
     (aiStep.captured != 0 ? m_sndCapture : m_sndMove)->play();
 
@@ -2150,6 +2259,7 @@ void MainWindow::handleBoardPress(const QPoint &pos, const QSize &viewSize,
             m_history.push_back(playerStep);
             m_last = playerStep.move;
             m_hasLast = true;
+            animateMove(playerStep.move);   // 落子动画：玩家这步从起点滑向终点
             // 残局：统计玩家步数（超上限判负）
             if (m_endgameIdx >= 0) {
                 m_endgameMoves++;
@@ -2373,44 +2483,67 @@ void MainWindow::renderBoard(QPainter &p, const QSize &viewSize)
 
     // ---- 8. 棋子 ----
     const qreal radius = g.cell * 0.43;
-    QFont pieceFont(QStringLiteral("KaiTi"));
-    pieceFont.setStyleHint(QFont::Serif);
-    pieceFont.setBold(true);
-    pieceFont.setPixelSize(int(g.cell * 0.52));
+    // 字体缓存：cell 尺寸不变时复用，避免 60fps 动画时每次创建 QFont
+    const int cellPx = int(g.cell);
+    if (m_pieceFontCell != cellPx) {
+        m_pieceFont = QFont(QStringLiteral("KaiTi"));
+        m_pieceFont.setStyleHint(QFont::Serif);
+        m_pieceFont.setBold(true);
+        m_pieceFont.setPixelSize(int(g.cell * 0.52));
+        m_pieceFontCell = cellPx;
+    }
+
+    // 单枚棋子完整绘制（阴影+渐变棋身+字）：静态棋子与滑动动画共用
+    auto drawOnePiece = [&](const QPointF &center, int code) {
+        // 阴影
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 0, 45));
+        p.drawEllipse(center + QPointF(1.5, 2.5), radius, radius);
+
+        // 棋身：象牙色径向渐变
+        QRadialGradient body(center - QPointF(radius * 0.35, radius * 0.35),
+                             radius * 1.25);
+        body.setColorAt(0.0, QColor(255, 251, 238));
+        body.setColorAt(0.7, QColor(247, 228, 190));
+        body.setColorAt(1.0, QColor(226, 192, 138));
+        p.setBrush(body);
+        p.setPen(QPen(kLineColor, 2.2));
+        p.drawEllipse(center, radius, radius);
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(140, 96, 48), 1.0));
+        p.drawEllipse(center, radius * 0.86, radius * 0.86);
+
+        // 棋子字
+        p.setFont(m_pieceFont);
+        p.setPen(isRed(code) ? kRedText : kBlackText);
+        const QRectF tb(center.x() - radius, center.y() - radius,
+                        2 * radius, 2 * radius);
+        p.drawText(tb, Qt::AlignCenter, pieceText(code));
+    };
 
     for (int r = 0; r < kRows; ++r) {
         for (int c = 0; c < kCols; ++c) {
             const int code = coreBoard[r][c];
             if (code == 0)
                 continue;
-
-            const QPointF center = dp(r, c);
-
-            // 阴影
-            p.setPen(Qt::NoPen);
-            p.setBrush(QColor(0, 0, 0, 45));
-            p.drawEllipse(center + QPointF(1.5, 2.5), radius, radius);
-
-            // 棋身：象牙色径向渐变
-            QRadialGradient body(center - QPointF(radius * 0.35, radius * 0.35),
-                                 radius * 1.25);
-            body.setColorAt(0.0, QColor(255, 251, 238));
-            body.setColorAt(0.7, QColor(247, 228, 190));
-            body.setColorAt(1.0, QColor(226, 192, 138));
-            p.setBrush(body);
-            p.setPen(QPen(kLineColor, 2.2));
-            p.drawEllipse(center, radius, radius);
-            p.setBrush(Qt::NoBrush);
-            p.setPen(QPen(QColor(140, 96, 48), 1.0));
-            p.drawEllipse(center, radius * 0.86, radius * 0.86);
-
-            // 棋子字
-            p.setFont(pieceFont);
-            p.setPen(isRed(code) ? kRedText : kBlackText);
-            const QRectF tb(center.x() - radius, center.y() - radius,
-                            2 * radius, 2 * radius);
-            p.drawText(tb, Qt::AlignCenter, pieceText(code));
+            // 落子动画期间：终点棋子不画静态（由下方滑动棋子顶替）
+            if (m_moveAnimActive && r == m_moveAnim.x2 && c == m_moveAnim.y2)
+                continue;
+            drawOnePiece(dp(r, c), code);
         }
+    }
+
+    // ---- 8.5 落子滑动动画：棋子从起点 ease-out 滑向终点（画在最上层）----
+    if (m_moveAnimActive && m_moveAnimPiece != 0) {
+        const qreal t = qreal(m_moveAnimFrame + 1) / kMoveAnimFrames;
+        const qreal e = 1.0 - (1.0 - t) * (1.0 - t);   // ease-out：先快后慢
+        const qreal row = m_moveAnim.x1 + (m_moveAnim.x2 - m_moveAnim.x1) * e;
+        const qreal col = m_moveAnim.y1 + (m_moveAnim.y2 - m_moveAnim.y1) * e;
+        // 浮点版 displayPt（执黑时旋转 180°）
+        qreal dr = row, dc = col;
+        if (!m_playerRed) { dr = (kRows - 1) - dr; dc = (kCols - 1) - dc; }
+        drawOnePiece(QPointF(g.ox + dc * g.cell, g.oy + dr * g.cell),
+                     m_moveAnimPiece);
     }
 
     // ---- 9. 选中金圈 ----
@@ -2457,6 +2590,51 @@ void MainWindow::renderBoard(QPainter &p, const QSize &viewSize)
 // ============================================================================
 // 联机模式：收到对方走子 → 在本机棋盘上落子
 // ============================================================================
+// 中途加入观战：按服务器着法历史从初始布局快放到当前局面（静音、不判胜负、不做长将检测）
+void MainWindow::replayMoves(const QJsonArray &moves)
+{
+    if (!m_isSpectator || moves.isEmpty())
+        return;
+    m_moveAnimActive = false;   // 快放回放不做动画，先清掉可能残留的滑动状态
+    m_moveAnimTimer->stop();
+    for (const auto &v : moves) {
+        const QJsonObject o = v.toObject();
+        const int x1 = o.value(QStringLiteral("x1")).toInt();
+        const int y1 = o.value(QStringLiteral("y1")).toInt();
+        const int x2 = o.value(QStringLiteral("x2")).toInt();
+        const int y2 = o.value(QStringLiteral("y2")).toInt();
+        if (x1 < 0 || x1 > 9 || y1 < 0 || y1 > 8 || x2 < 0 || x2 > 9 || y2 < 0 || y2 > 8)
+            continue;
+        Step step;
+        step.captured = coreBoard[x2][y2];
+        step.piece = coreBoard[x1][y1];
+        step.move = Move(x1, y1, x2, y2);
+        step.byRed = isRed(step.piece);
+        executeMove(step.move);
+        m_history.push_back(step);
+        m_last = step.move;
+        m_hasLast = true;
+    }
+    if (m_view)
+        m_view->update();
+}
+
+// 落子滑动动画：走子落定后调用，棋子从起点 ease-out 滑向终点（看清每步从哪走到哪）
+void MainWindow::animateMove(const Move &mv)
+{
+    if (!m_view || m_moveAnimTimer == nullptr)
+        return;
+    // 走子已落定：终点格就是刚走的棋子（被吃的子已被移除）
+    const int piece = coreBoard[mv.x2][mv.y2];
+    if (piece == 0)
+        return;
+    m_moveAnim = mv;
+    m_moveAnimPiece = piece;
+    m_moveAnimFrame = 0;
+    m_moveAnimActive = true;
+    m_moveAnimTimer->start();
+}
+
 void MainWindow::onNetworkMoveReceived(int x1, int y1, int x2, int y2)
 {
     if (m_mode != GameMode::Online)
@@ -2465,29 +2643,46 @@ void MainWindow::onNetworkMoveReceived(int x1, int y1, int x2, int y2)
     if (x1 < 0 || x1 > 9 || y1 < 0 || y1 > 8 || x2 < 0 || x2 > 9 || y2 < 0 || y2 > 8)
         return;
 
+    // 双保险：对局者只可能收到对方颜色的走子（服务器已做权威回合校验，
+    // 这里再拦一次本地/回声类的乱序走子，防止棋盘被非法步污染）
+    if (!m_isSpectator) {
+        const int srcPiece = coreBoard[x1][y1];
+        if (srcPiece != 0 && isRed(srcPiece) == m_playerRed)
+            return;
+    }
+
     const Move opp(x1, y1, x2, y2);
     Step oppStep;
     oppStep.captured = coreBoard[x2][y2];
     oppStep.piece = coreBoard[x1][y1];
     executeMove(opp);        // 对方已在自己棋盘上校验过，直接落子
     oppStep.move = opp;
-    oppStep.byRed = !m_playerRed;   // 对方走的是我方对面的颜色
+    // 对局者：对方走的一定是我方对面的颜色；观战者：按棋子颜色判断（双方走子都会到达）
+    oppStep.byRed = m_isSpectator ? isRed(oppStep.piece) : !m_playerRed;
     m_history.push_back(oppStep);
     m_last = opp;
     m_hasLast = true;
+    animateMove(opp);   // 落子动画：看清对方/观战双方这步从哪走到哪
 
     // 对方吃子用对面音效，普通走动用木质落子声
     (oppStep.captured != 0 ? m_sndCapture : m_sndMove)->play();
 
     // 长将/重复局面检测：对方走子后导致重复局面 → 对方判负（我方赢）
-    {
+    // 观战者不做判罚（视角无"对方"概念，由双方上报终局），只看棋
+    if (!m_isSpectator) {
         const uint64_t newHash = getBoardHash(coreBoard, !m_playerRed);
-        if (isGameRepetition(newHash)) {
+        // 至少 6 步（3 个完整回合）才可能产生真正的重复局面，少于 6 步不判犯规
+        if (m_history.size() >= 6 && isGameRepetition(newHash)) {
             m_gameOver = true;
             statusBar()->showMessage(QStringLiteral("对方长将犯规 —— 你赢了！"));
-            m_sndWin->play();
             pushGameHash(newHash);
             m_view->update();
+            if (m_botPlay) {
+                botRestartLoop();
+                refreshButtons();
+                return;
+            }
+            m_sndWin->play();
             QMessageBox::information(this,
                 QStringLiteral("对局结束"),
                 QStringLiteral("对方长将犯规，你赢了！\n（连续重复局面自动判负）"));
@@ -2498,8 +2693,8 @@ void MainWindow::onNetworkMoveReceived(int x1, int y1, int x2, int y2)
         pushGameHash(newHash);
     }
 
-    // 判终局
-    const int myState = checkGameOver(coreBoard, m_playerRed);
+    // 判终局（观战者不判：等双方上报 game_end 再收摊）
+    const int myState = m_isSpectator ? 0 : checkGameOver(coreBoard, m_playerRed);
     if (myState != 0)
         m_gameOver = true;
     updateCheckState();
@@ -2520,17 +2715,23 @@ void MainWindow::onNetworkMoveReceived(int x1, int y1, int x2, int y2)
             : QStringLiteral("你无子可动（困毙）");
         statusBar()->showMessage(QStringLiteral("对方胜利！") + reason);
         m_animTimer->stop();
-        m_sndLose->play();
-        QMessageBox::information(this,
-            QStringLiteral("对局结束"),
-            QStringLiteral("对方胜利！\n%1\n杀法：%2").arg(reason, kill));
+        if (m_botPlay) {
+            botRestartLoop();
+        } else {
+            m_sndLose->play();
+            QMessageBox::information(this,
+                QStringLiteral("对局结束"),
+                QStringLiteral("对方胜利！\n%1\n杀法：%2").arg(reason, kill));
+        }
+    } else if (m_isSpectator) {
+        statusBar()->showMessage(QStringLiteral("观战中…"));
     } else {
         statusBar()->showMessage(m_playerRed
             ? QStringLiteral("红方走棋（轮到你了）")
             : QStringLiteral("黑方走棋（轮到你了）"));
         // 挂机中：稍等半秒（留个"停止挂机"的窗口），奶娃自动出手
         if (m_afk) {
-            QTimer::singleShot(500, this, [this]() { startAfkMove(); });
+            m_afkTimer->start(500);   // 成员 timer：start() 重启而非堆叠，确保只有一个待触发
         }
     }
     refreshButtons();
@@ -2543,8 +2744,12 @@ void MainWindow::onNetworkChatReceived(const QString &text)
 {
     if (!m_chatView)
         return;
+    QString body = text;
+    maybePlayVoice(body, false);   // 对局女号 bot 说话带语音（哼/可恶/嘻嘻…），对手直接对我说话不过滤
+    if (body.trimmed().isEmpty())
+        return;   // 纯语音消息不留空气泡
     StickerPicker::appendMessage(
-        m_chatView, QStringLiteral("<b style='color:#c0392b'>对方：</b>"), text);
+        m_chatView, QStringLiteral("<b style='color:#c0392b'>对方：</b>"), body);
 }
 
 // ============================================================================
@@ -2627,7 +2832,7 @@ void MainWindow::setPeerAvatar(const QString &key)
 // 加入者：收到房主端奶娃状态（首条消息会让帮手条现身）
 void MainWindow::onNetworkAvatar(const QString &key)
 {
-    if (m_mode != GameMode::Online || m_isHost)
+    if (m_mode != GameMode::Online || m_isHost || m_isSpectator)
         return;
     if (m_peerBar)
         m_peerBar->setVisible(true);
@@ -2653,6 +2858,12 @@ void MainWindow::onNetworkResign()
     m_sndWin->play();
     if (m_chatView)
         m_chatView->append(QStringLiteral("<i style='color:#27ae60'>—— 对方投降，你赢了！ ——</i>"));
+    if (m_botPlay) {
+        botRestartLoop();
+        refreshButtons();
+        m_view->update();
+        return;
+    }
     QMessageBox::information(this,
         QStringLiteral("对局结束"),
         QStringLiteral("对方投降了，你赢了！🎉"));
@@ -2674,6 +2885,20 @@ void MainWindow::onPeerDisconnected()
         m_peerBar->setVisible(false);   // 房主端奶娃随连接一起消失
     if (m_chatView)
         m_chatView->append(QStringLiteral("<i style='color:#888'>—— 对方已断开连接 ——</i>"));
+    // 观战：对局收摊不自动关窗（自动关窗用户会以为程序崩溃），留窗看终盘，手动返回
+    if (m_isSpectator) {
+        statusBar()->showMessage(QStringLiteral("对局已结束，可返回主菜单观看其他对局"));
+        if (m_chatView)
+            m_chatView->append(QStringLiteral("<i style='color:#888'>—— 本局对局已结束 ——</i>"));
+        refreshButtons();
+        return;
+    }
+    // 机器人：不弹窗，关窗回菜单重开下一局
+    if (m_botPlay) {
+        botRestartLoop();
+        refreshButtons();
+        return;
+    }
     QMessageBox::warning(this,
         QStringLiteral("连接断开"),
         QStringLiteral("对方已离开房间，对局结束。"));
@@ -2701,11 +2926,11 @@ void MainWindow::sendChatMessage()
 // ============================================================================
 void MainWindow::onNetworkVersion(const QString &ver)
 {
-    if (ver == QStringLiteral("3.2.0"))
+    if (ver == QStringLiteral("3.3.0"))
         return;
     if (m_chatView)
         m_chatView->append(QStringLiteral(
-            "<i style='color:#c0392b'>⚠ 对方版本（%1）与本机（3.2.0）不一致，"
+            "<i style='color:#c0392b'>⚠ 对方版本（%1）与本机（3.3.0）不一致，"
             "请双方都用最新安装包，否则可能出现走棋不同步</i>").arg(ver.toHtmlEscaped()));
 }
 
@@ -2734,7 +2959,10 @@ void MainWindow::sendUndoRequest()
 
 void MainWindow::onNetworkUndoRequest()
 {
-    if (m_gameOver || m_aiThinking) {
+    // 观战者不参与悔棋（服务器转发的事件，忽略）；机器人自动拒绝不弹窗
+    if (m_isSpectator)
+        return;
+    if (m_botPlay || m_gameOver || m_aiThinking) {
         m_net->sendUndoAnswer(false);
         return;
     }
@@ -2778,6 +3006,8 @@ void MainWindow::performOnlineUndo(bool requesterIsMe)
 
     m_gameOver = false;
     clearSelection();
+    m_moveAnimActive = false;   // 联机悔棋棋盘回退，停掉滑动动画
+    m_moveAnimTimer->stop();
     m_avatarTimer->stop();
     setAvatar(AvatarState::Idle);
     if (m_history.empty()) {
@@ -2814,6 +3044,13 @@ void MainWindow::sendRestartRequest()
 
 void MainWindow::onNetworkRestartRequest()
 {
+    // 观战者不参与重开协商；机器人自动拒绝不弹窗
+    if (m_isSpectator)
+        return;
+    if (m_botPlay) {
+        m_net->sendRestartAnswer(false);
+        return;
+    }
     const auto ret = QMessageBox::question(this,
         QStringLiteral("重新开始"),
         QStringLiteral("对方请求重新开始，是否同意？"),
@@ -2848,6 +3085,8 @@ void MainWindow::applyOnlineRestart()
     m_history.clear();
     clearSelection();
     m_hasLast = false;
+    m_moveAnimActive = false;   // 联机重开，清掉滑动动画
+    m_moveAnimTimer->stop();
     m_gameOver = false;
     m_resultReported = false;
     m_aiThinking = false;
@@ -2938,9 +3177,9 @@ void MainWindow::startAfkMove()
 
     m_aiThread = new AiThread();
     std::memcpy(m_aiThread->m_board, coreBoard, sizeof(coreBoard));
-    // 8 秒思考：搜索在独立 QThread 中进行，不阻塞 UI；
-    // 加长只提高棋力与真实感，内存/CPU 峰值与短思考相同（置换表固定大小）
-    m_aiThread->m_timeMs = 8000;
+    // 3 秒思考：搜索在独立 QThread 中进行，不阻塞 UI；
+    // 实时对局不追求最强棋力，短思考响应更流畅
+    m_aiThread->m_timeMs = 3000;
     m_aiThread->m_redSide = m_playerRed;   // 替房主（我方）想
     connect(m_aiThread, &QThread::finished, this, &MainWindow::onAfkFinished);
     connect(m_aiThread, &QThread::finished, m_aiThread, &QObject::deleteLater);
@@ -2958,6 +3197,7 @@ void MainWindow::onAfkFinished()
     m_aiThread = nullptr;
     m_thinkTimer->stop();
     m_aiThinking = false;
+    m_myTurn = false;   // 提前标记不走子：防止后续代码触发的事件中 startAfkMove 误判轮到自己
 
     // 兜底：我方无棋可走 = 我方输
     if (!(inBoard(mv.x1, mv.y1) && inBoard(mv.x2, mv.y2))) {
@@ -2967,6 +3207,11 @@ void MainWindow::onAfkFinished()
         setAvatar(AvatarState::Win);
         m_sndLose->play();
         m_view->update();
+        if (m_botPlay) {
+            botRestartLoop();
+            refreshButtons();
+            return;
+        }
         QMessageBox::information(this,
             QStringLiteral("对局结束"),
             QStringLiteral("对方胜利！\n你方无子可动（困毙）"));
@@ -2984,16 +3229,22 @@ void MainWindow::onAfkFinished()
     m_history.push_back(s);
     m_last = mv;
     m_hasLast = true;
+    animateMove(mv);   // 落子动画：奶娃挂机这步滑动
 
     // ---- 奶娃落子后：长将/重复局面检测 ----
     {
         const uint64_t newHash = getBoardHash(coreBoard, m_playerRed);
-        if (isGameRepetition(newHash)) {
+        if (m_history.size() >= 6 && isGameRepetition(newHash)) {
             m_gameOver = true;
             statusBar()->showMessage(QStringLiteral("奶娃长将犯规 —— 你输了！"));
             m_sndLose->play();
             pushGameHash(newHash);
             m_view->update();
+            if (m_botPlay) {
+                botRestartLoop();
+                refreshButtons();
+                return;
+            }
             QMessageBox::information(this,
                 QStringLiteral("对局结束"),
                 QStringLiteral("奶娃长将犯规，你输了！\n（连续重复局面自动判负）"));
@@ -3028,7 +3279,6 @@ void MainWindow::onAfkFinished()
 
     // ---- 走法必须在弹任何终局对话框之前发出：模态对话框会阻塞事件循环，
     // 若先弹窗，对方要等到本方点掉弹窗才能收到这步（看着就像"卡死在将军一步"）----
-    m_myTurn = false;
     if (m_net)
         m_net->sendMove(mv.x1, mv.y1, mv.x2, mv.y2);
 
@@ -3046,6 +3296,11 @@ void MainWindow::onAfkFinished()
         m_view->update();
         if (m_chatView)
             m_chatView->append(QStringLiteral("<i style='color:#8e44ad'>🐲 奶娃：轻轻松松，带你吃鸡！</i>"));
+        if (m_botPlay) {
+            botRestartLoop();
+            refreshButtons();
+            return;
+        }
         QMessageBox::information(this,
             QStringLiteral("对局结束"),
             QStringLiteral("🎉 奶娃代打胜利！\n%1\n杀法：%2").arg(reason, kill));
@@ -3078,5 +3333,168 @@ void MainWindow::playAfkCaptureAction(bool useNewGif)
         m_avatarMovie->start();
         m_avatarTimer->start(1300);
     }
+}
+
+// ============================================================================
+// 观战相关：观众发言显示 / 终局结果展示
+// ============================================================================
+// 女号语音：检测 [voice:xxx] 前缀，摘前缀+播放对应音效（机器人/观战静音时不播）
+QString MainWindow::s_localName;
+int MainWindow::s_openGameWindows = 0;
+
+void MainWindow::maybePlayVoice(QString &text, bool ambient)
+{
+    static const QRegularExpression re(QStringLiteral("^\\[voice:([a-z0-9]+)\\]"));
+    const auto m = re.match(text);
+    if (!m.hasMatch())
+        return;
+    const QString key = m.captured(1);
+    text = text.mid(m.capturedLength());
+    if (m_botPlay)
+        return;   // 机器人后台静音
+    // 环境闲聊（观战席/对局里的观众发言）只听提到自己昵称的语音，其余静默
+    if (ambient && !s_localName.isEmpty() && !text.contains(s_localName))
+        return;
+    auto *&fx = m_voiceFx[key];
+    if (!fx) {
+        fx = new QSoundEffect(this);
+        fx->setSource(QUrl(QStringLiteral("qrc:/sounds/voice/%1.wav").arg(key)));
+        fx->setVolume(0.9f);
+    }
+    if (fx->status() == QSoundEffect::Ready || !fx->source().isEmpty())
+        fx->play();
+}
+
+void MainWindow::onSpecChatReceived(const QString &fromName, const QString &fromAvatar,
+                                    const QString &text)
+{
+    if (!m_chatView)
+        return;
+    QString body = text;
+    maybePlayVoice(body, true);   // 观战席=环境闲聊，只有 @我 才出声
+    if (body.trimmed().isEmpty())
+        return;   // 纯语音消息不留空气泡
+    // 头像：磁盘缓存有就直接 <img> 圆头像，没有就只显名字（后台触发下载，下条消息起有头像）
+    QString avatarImg;
+    if (!fromAvatar.isEmpty()) {
+        const QString fullUrl = ServerConfig::serverUrl() + fromAvatar;
+        const QString cached = ApiClient::avatarCachePath(fullUrl);
+        if (!cached.isEmpty()) {
+            avatarImg = QStringLiteral("<img src='file:///%1' width='20' height='20'> ")
+                            .arg(QString(cached).replace('\\', '/'));
+        } else {
+            // 懒下载进缓存（共享一个静态 ApiClient，MainWindow 本体不持有）
+            static QPointer<ApiClient> s_dl = nullptr;
+            if (!s_dl) s_dl = new ApiClient(qApp);
+            s_dl->downloadAvatar(fullUrl);
+        }
+    }
+    const QString safe = fromName.toHtmlEscaped();
+    const QString prefix = m_isSpectator
+        ? QStringLiteral("%1<b style='color:#8e44ad'>%2：</b>").arg(avatarImg, safe)
+        : QStringLiteral("%1<b style='color:#8e44ad'>观众 %2：</b>").arg(avatarImg, safe);
+    StickerPicker::appendMessage(m_chatView, prefix, body);
+}
+
+void MainWindow::onGameEndReceived(const QString &result)
+{
+    if (m_mode != GameMode::Online)
+        return;
+    m_gameOver = true;
+    m_resultReported = true;
+    const QString txt = result == QLatin1String("red_win") ? QStringLiteral("红方胜利")
+                       : result == QLatin1String("black_win") ? QStringLiteral("黑方胜利")
+                       : QStringLiteral("平局");
+    statusBar()->showMessage(QStringLiteral("对局结束：%1").arg(txt));
+    if (m_chatView)
+        m_chatView->append(QStringLiteral(
+            "<i style='color:#27ae60'>—— 对局结束：%1 ——</i>").arg(txt));
+    refreshButtons();
+    m_view->update();
+    if (m_botPlay)
+        botRestartLoop();
+}
+
+// ============================================================================
+// 机器人代打（--bot 命令行模式）
+// ============================================================================
+// 女号对局机器人语音标记与表情混发（可爱/傲娇/冰冷三系各自语料在 keepalive 中，
+// 对局 bot 这里的语料走通用撒娇语气，30% 概率带语音前缀）
+QString MainWindow::botChatLine()
+{
+    static const QStringList lines = {
+        QStringLiteral("[sticker:s01]"),
+        QStringLiteral("[sticker:s03]"),
+        QStringLiteral("[sticker:s05]"),
+        QStringLiteral("[sticker:s07]"),
+        QStringLiteral("[sticker:s09]"),
+        QStringLiteral("[sticker:s11]"),
+        // 真人甜妹录音为主（v1~v6），合成语音只留少量点缀
+        QStringLiteral("[voice:v1]"),
+        QStringLiteral("[voice:v2]"),
+        QStringLiteral("[voice:v3]"),
+        QStringLiteral("[voice:v4]"),
+        QStringLiteral("[voice:v5]"),
+        QStringLiteral("[voice:v6]"),
+        QStringLiteral("[voice:giggle]嘻嘻～加油加油！"),
+        QStringLiteral("[voice:lihai]厉害呀！"),
+        QStringLiteral("[voice:heng]下一把换我先走"),
+        // 闲聊短句：像真人一样边下边聊
+        QStringLiteral("你走得好快呀，等等我嘛"),
+        QStringLiteral("这局我要认真了哦"),
+        QStringLiteral("哎呀，差点走错了"),
+        QStringLiteral("你的棋下得还不错嘛"),
+        QStringLiteral("我就随便走走啦，别笑话我"),
+        QStringLiteral("嘿嘿，看我这一步！"),
+        QStringLiteral("别催别催，人家在想呢"),
+        QStringLiteral("这棋走得我手心冒汗"),
+        QStringLiteral("你先说话，我一紧张就走不好了"),
+        QStringLiteral("输了可不许笑我哦"),
+    };
+    return lines.at(QRandomGenerator::global()->bounded(lines.size()));
+}
+
+// 机器人：跳过召唤动画直接开启奶娃挂机代打（红黑双方都可用）
+void MainWindow::enableBotAfk()
+{
+    if (m_mode != GameMode::Online || m_isSpectator || m_gameOver || m_botChatTimer)
+        return;
+    m_dragonSummoned = true;
+    m_afk = true;
+    if (m_afkBtn) {
+        m_afkBtn->setVisible(true);
+        m_afkBtn->setText(QStringLiteral("⏹ 停止挂机"));
+    }
+    if (m_summonBtn)
+        m_summonBtn->setVisible(false);
+    // 机器人闲聊：随机 20~90 秒发一句表情/短语（对方与观战者都可见）
+    m_botChatTimer = new QTimer(this);
+    m_botChatTimer->setSingleShot(true);
+    connect(m_botChatTimer, &QTimer::timeout, this, [this]() {
+        if (m_gameOver || !m_net)
+            return;
+        m_net->sendChat(botChatLine());
+        m_botChatTimer->start(QRandomGenerator::global()->bounded(20000, 90000));
+    });
+    m_botChatTimer->start(QRandomGenerator::global()->bounded(15000, 40000));
+    startAfkMove();   // 若当前轮到本方，立即出手；否则等对方走完自动续
+}
+
+// 机器人：终局后稍等片刻直接退出进程（由编排脚本重启进下一局）
+void MainWindow::botRestartLoop()
+{
+    if (!m_botPlay)
+        return;
+    // 留 1.5 秒给服务器转发终局/对方收摊，然后绕开 closeEvent 直接退出，
+    // 避免模态弹窗/事件循环阻塞导致进程挂死
+    QTimer::singleShot(1500, this, [this]() {
+        if (m_net) {
+            if (m_isSpectator)
+                m_net->sendSpectateLeave();
+            else
+                m_net->leaveRoom();
+        }
+        qApp->exit(0);
+    });
 }
 

@@ -15,6 +15,11 @@
 #include <QHttpMultiPart>
 #include <QHttpPart>
 #include <QPixmap>
+#include <QPainter>
+#include <QPainterPath>
+#include <QStandardPaths>
+#include <QDir>
+#include <QCryptographicHash>
 
 ApiClient::ApiClient(QObject *parent) : QObject(parent) {}
 
@@ -169,8 +174,29 @@ void ApiClient::uploadAvatar(const QString &accessToken, const QString &filePath
     });
 }
 
+// 头像磁盘缓存目录：AppDataLocation/avatarCache/<md5(url)>.png（存裁圆后的 96px PNG）
+QString ApiClient::avatarCachePath(const QString &url)
+{
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                        + QStringLiteral("/avatarCache");
+    QDir().mkpath(dir);
+    const QString name = QString::fromLatin1(
+        QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Md5).toHex());
+    const QString path = dir + QLatin1Char('/') + name + QStringLiteral(".png");
+    return QFile::exists(path) ? path : QString();
+}
+
 void ApiClient::downloadAvatar(const QString &url)
 {
+    // 磁盘缓存命中：直接发信号，不走网络（cpolar 公网下载慢，缓存是主要提速手段）
+    const QString cached = avatarCachePath(url);
+    if (!cached.isEmpty()) {
+        QPixmap pm(cached);
+        if (!pm.isNull()) {
+            emit avatarDownloaded(url, pm);
+            return;
+        }
+    }
     QNetworkRequest req((QUrl(url)));
     QNetworkReply *reply = m_nam.get(req);
     connect(reply, &QNetworkReply::finished, this, [this, reply, url]() {
@@ -180,8 +206,32 @@ void ApiClient::downloadAvatar(const QString &url)
         }
         QPixmap pm;
         pm.loadFromData(reply->readAll());
-        if (!pm.isNull())
-            emit avatarDownloaded(url, pm);
+        if (pm.isNull())
+            return;
+        QPixmap out;
+        if (url.contains(QLatin1String("/avatars/"))) {
+            // 头像裁圆 96px 存磁盘缓存（QTextEdit 的 <img> 不支持 CSS 圆角，预裁圆后聊天区可直接引用）
+            QPixmap scaled = pm.scaled(96, 96, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            QPixmap circle(96, 96);
+            circle.fill(Qt::transparent);
+            QPainter p(&circle);
+            p.setRenderHint(QPainter::Antialiasing);
+            QPainterPath path;
+            path.addEllipse(0, 0, 96, 96);
+            p.setClipPath(path);
+            p.drawPixmap(0, 0, scaled);
+            p.end();
+            out = circle;
+        } else {
+            out = pm;   // 背景图等非头像：保留原图
+        }
+        const QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+                            + QStringLiteral("/avatarCache");
+        QDir().mkpath(dir);
+        const QString name = QString::fromLatin1(
+            QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Md5).toHex());
+        out.save(dir + QLatin1Char('/') + name + QStringLiteral(".png"), "PNG");
+        emit avatarDownloaded(url, out);
     });
 }
 
@@ -427,6 +477,25 @@ void ApiClient::getJson(const QString &path, const QString &accessToken)
                 list.append(f);
             }
             emit friendsOk(list);
+        } else if (path.endsWith("/api/inventory")) {
+            emit inventoryOk(obj.value("money").toInt(), obj.value("candy0").toInt(),
+                             obj.value("candy1").toInt(), obj.value("candy2").toInt());
+        } else if (path.endsWith("/api/mails")) {
+            QList<MailInfo> list;
+            const QJsonArray arr = obj.value("mails").toArray();
+            for (const QJsonValue &v : arr) {
+                const QJsonObject mo = v.toObject();
+                MailInfo m;
+                m.id = mo.value("id").toInt();
+                m.title = mo.value("title").toString();
+                m.body = mo.value("body").toString();
+                m.attachKind = mo.value("attach_kind").toString();
+                m.attachAmount = mo.value("attach_amount").toInt();
+                m.claimed = mo.value("claimed").toInt() != 0;
+                m.createdAt = mo.value("created_at").toString();
+                list.append(m);
+            }
+            emit mailsOk(list);
         }
     });
 }
@@ -467,6 +536,14 @@ void ApiClient::postJsonAuth(const QString &path, const QByteArray &json, const 
                    || path.endsWith("/profile/title")) {
             UserInfo user = parseUser(obj.value("user").toObject());
             emit profileUpdated(user);
+        } else if (path.endsWith("/api/inventory")) {
+            emit inventoryOk(obj.value("money").toInt(), obj.value("candy0").toInt(),
+                             obj.value("candy1").toInt(), obj.value("candy2").toInt());
+        } else if (path.endsWith("/api/mails/claim")) {
+            const QJsonObject inv = obj.value("inventory").toObject();
+            emit mailClaimOk(obj.value("id").toInt(), inv.value("money").toInt(),
+                             inv.value("candy0").toInt(), inv.value("candy1").toInt(),
+                             inv.value("candy2").toInt());
         }
     });
 }
@@ -489,6 +566,77 @@ void ApiClient::patchJsonAuth(const QString &path, const QByteArray &json, const
             emit profileUpdated(user);
         }
     });
+}
+
+// ---------- 道具库存 / 系统邮件 ----------
+void ApiClient::fetchInventory(const QString &accessToken)
+{
+    getJson("/api/inventory", accessToken);
+}
+
+// 进行中对局列表：轮询用，失败静默（不打扰用户，等下一轮刷新）
+void ApiClient::listRooms(const QString &accessToken)
+{
+    QNetworkRequest req((QUrl(ServerConfig::apiUrl(QStringLiteral("/api/rooms")))));
+    req.setRawHeader("Authorization", ("Bearer " + accessToken).toUtf8());
+    QNetworkReply *reply = m_nam.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError)
+            return;
+        const QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
+        QList<LiveRoomInfo> list;
+        const QJsonArray arr = obj.value("rooms").toArray();
+        for (const QJsonValue &v : arr) {
+            const QJsonObject ro = v.toObject();
+            LiveRoomInfo ri;
+            ri.roomId = ro.value("room_id").toString();
+            ri.red = parseUser(ro.value("red").toObject());
+            ri.black = parseUser(ro.value("black").toObject());
+            ri.spectators = ro.value("spectators").toInt();
+            list.append(ri);
+        }
+        emit roomsOk(list);
+    });
+}
+
+// 邀约机器人目标列表：轮询用，失败静默（下轮再拉）
+void ApiClient::fetchBotTargets(const QString &accessToken)
+{
+    QNetworkRequest req((QUrl(ServerConfig::apiUrl(QStringLiteral("/api/bot/targets")))));
+    req.setRawHeader("Authorization", ("Bearer " + accessToken).toUtf8());
+    QNetworkReply *reply = m_nam.get(req);
+    connect(reply, &QNetworkReply::finished, this, [this, reply]() {
+        reply->deleteLater();
+        if (reply->error() != QNetworkReply::NoError)
+            return;
+        const QJsonObject obj = QJsonDocument::fromJson(reply->readAll()).object();
+        QList<int> targets;
+        for (const QJsonValue &v : obj.value("targets").toArray())
+            targets.append(v.toInt());
+        emit botTargetsOk(targets);
+    });
+}
+
+void ApiClient::pushInventory(const QString &accessToken, const QString &key, int delta)
+{
+    QJsonObject deltas;
+    deltas[key] = delta;
+    QJsonObject obj;
+    obj["deltas"] = deltas;
+    postJsonAuth("/api/inventory", QJsonDocument(obj).toJson(QJsonDocument::Compact), accessToken);
+}
+
+void ApiClient::listMails(const QString &accessToken)
+{
+    getJson("/api/mails", accessToken);
+}
+
+void ApiClient::claimMail(const QString &accessToken, int mailId)
+{
+    QJsonObject obj;
+    obj["id"] = mailId;
+    postJsonAuth("/api/mails/claim", QJsonDocument(obj).toJson(QJsonDocument::Compact), accessToken);
 }
 
 UserInfo ApiClient::parseUser(const QJsonObject &obj)
