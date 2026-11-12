@@ -22,6 +22,10 @@ class QMovie;
 class QSlider;
 class QMediaPlayer;
 class QAudioOutput;
+class QTextEdit;
+class QLineEdit;
+class QFrame;
+class NetworkManager;
 
 // 棋盘显示控件：所有 QPainter 绘制和鼠标点击都经由它转发给 MainWindow
 class BoardView : public QWidget
@@ -59,7 +63,12 @@ class MainWindow : public QMainWindow
 {
     Q_OBJECT
 public:
-    explicit MainWindow(QWidget *parent = nullptr);
+    enum class GameMode { SinglePlayer, Online };
+
+    explicit MainWindow(GameMode mode = GameMode::SinglePlayer,
+                        bool isHost = false,
+                        NetworkManager *net = nullptr,
+                        QWidget *parent = nullptr);
     ~MainWindow();
 
     // 供 BoardView 调用
@@ -77,6 +86,24 @@ private slots:
     void onMusicChanged(int index);  // 切换背景音乐
     void onSideChanged(int index);   // 切换先手/后手（重开一局）
     void setSfxMuted(bool muted);    // 音乐开启时静音全部音效
+
+    // ===== 联机模式 =====
+    void onNetworkMoveReceived(int x1, int y1, int x2, int y2);  // 对方走了一步
+    void onNetworkChatReceived(const QString &text);              // 收到对方聊天
+    void onNetworkAvatar(const QString &key);                     // 收到房主端奶娃状态
+    void onNetworkVersion(const QString &ver);                    // 收到对方版本号
+    void onNetworkUndoRequest();                                  // 对方请求悔棋
+    void onNetworkUndoAnswer(bool accepted);                      // 对方应答悔棋
+    void onNetworkRestartRequest();                               // 对方请求重新开始
+    void onNetworkRestartAnswer(bool accepted);                   // 对方应答重新开始
+    void onNetworkBadMove();                                      // 收到非法走子（对方版本过旧？）
+    void onPeerDisconnected();                                     // 对方掉线
+    void sendChatMessage();                                        // 发送聊天
+    void sendUndoRequest();                                        // 联机：发送悔棋请求
+    void sendRestartRequest();                                     // 联机：发送重新开始请求
+    void summonDragon();                                           // 房主：召唤奶龙（登场动画+解锁挂机）
+    void toggleAfk();          // 奶娃挂机 / 停止挂机 切换
+    void onAfkFinished();      // 挂机奶娃搜索结束：替房主自动落子并发给对方
 
 private:
     // 对面（AI）虚拟形象的状态
@@ -113,6 +140,19 @@ private:
     QMediaPlayer *m_musicPlayer = nullptr;
     QAudioOutput *m_audioOut = nullptr;
     bool m_playerRed = true;             // 玩家是否执红（先手）
+    // ===== 联机模式 =====
+    GameMode m_mode = GameMode::SinglePlayer;
+    bool m_isHost = false;               // 联机时是否房主（房主=红方先手）
+    bool m_myTurn = true;                // 联机时是否轮到本机走子
+    NetworkManager *m_net = nullptr;
+    QPushButton *m_summonBtn = nullptr;  // 房主专属：召唤奶龙（首次登场）
+    QPushButton *m_afkBtn = nullptr;     // 房主专属：奶娃挂机 / 停止挂机（召唤后出现）
+    bool m_dragonSummoned = false;       // 奶娃是否已登场
+    bool m_afk = false;                  // 是否正在挂机（奶娃替房主打）
+    QTextEdit *m_chatView = nullptr;     // 聊天消息显示
+    QLineEdit *m_chatInput = nullptr;    // 聊天输入框
+    bool m_waitingUndo = false;          // 已发悔棋请求，等对方答复
+    bool m_waitingRestart = false;       // 已发重开请求，等对方答复
     int m_bgIndex = 0;                   // 背景：0=木质 1=蓝发 2=魔龙 3=自定义
     QPixmap m_bgPixmap;                  // 背景图缓存（避免每次 paint 重新解码）
     QString m_customBgPath;              // 自定义背景图路径（exe 旁 assets/）
@@ -146,25 +186,44 @@ private:
     void logicalPt(int row, int col, int &lr, int &lc) const;
     void revertStep(const Step &s);     // 在 coreBoard 上撤销一步
     void startAiThinking();             // 拷贝棋盘并启动后台搜索线程
+    void startAfkMove();                // 挂机：奶娃替房主想一步并自动落子
+    void playAfkCaptureAction(bool useNewGif);  // 挂机吃子：随机播新/旧打人动图
     void updateCheckState();            // 刷新双方被将军状态 + 状态栏 + 将军音效
     void refreshButtons();
-    void initSounds();                  // 预加载全部音效（构造时一次性完成）
+    void initSounds();                  // 创建音效对象（构造时）
+    void loadSoundSources();            // 绑定音效资源（窗口显示后延迟执行，避免卡点击）
+    void ensureMusicPlayer();           // 背景音乐播放器懒加载（创建耗时数秒，延后到窗口显示后）
     void loadBgPixmap();                // 按 m_bgIndex 加载/刷新背景图缓存
     void loadCustomAssets();            // 启动时从 QSettings 恢复自定义背景/音乐
     QString copyToAssets(const QString &src, const QString &tag); // 复制用户文件到 exe 旁 assets/
     void initAvatar();                  // 初始化对面虚拟形象面板
     void setAvatar(AvatarState s);      // 切换形象图片/动图 + 心情文字
     void playCaptureReaction();         // 玩家吃掉 AI 棋子时的愤怒->动作序列
+    QString stateKey(AvatarState s) const;  // 形象状态 -> 同步协议关键字
+    void syncAvatar(const QString &key);    // 房主：奶娃状态广播给对面（其他情况空操作）
+    void setPeerAvatar(const QString &key); // 加入者：按房主同步的状态渲染帮手条
+    void performOnlineUndo(bool requesterIsMe);  // 联机悔棋通过后：双方同步回退到请求方上一步之前
+    void applyOnlineRestart();                   // 联机重开：双方同步重置棋盘
 
     QLabel *m_avatarImg = nullptr;      // 形象图片/动图显示区
     QLabel *m_avatarMood = nullptr;     // 形象心情文字
-    QMovie *m_avatarMovie = nullptr;    // 被吃子后的 gif 动作
+    QMovie *m_avatarMovie = nullptr;    // 被吃子后的 gif 动作（原版打人）
+    QMovie *m_avatarMovie2 = nullptr;   // 挂机奶娃吃子时的 gif 动作（新版出拳）
     QTimer *m_avatarTimer = nullptr;    // 反应序列定时器（单次触发）
     AvatarState m_avatarState = AvatarState::Idle;
+    QFrame *m_avatarPanel = nullptr;    // 右侧形象卡片（联机加入者隐藏）
+
+    // 联机加入者：底部“奶娃帮手”条（房主召唤奶娃后出现，状态由房主同步）
+    QWidget *m_peerBar = nullptr;
+    QLabel *m_peerImg = nullptr;
+    QLabel *m_peerMood = nullptr;
+    QMovie *m_peerMovie = nullptr;      // 48px 原版打人 gif
+    QMovie *m_peerMovie2 = nullptr;     // 48px 新版出拳 gif
 
     QSoundEffect *m_sndSelect = nullptr;      // 选中棋子（双方共用）
     QSoundEffect *m_sndMove = nullptr;        // 普通落子（双方共用）
     QSoundEffect *m_sndCapture = nullptr;     // 吃子（黑方/对面专用，来自视频）
+    QSoundEffect *m_sndCapture2 = nullptr;    // 吃子（挂机奶娃随机音效②，视频2提取）
     QSoundEffect *m_sndCaptureRed = nullptr;  // 吃子（红方/我方专用，原版合成音）
     QSoundEffect *m_sndCheck = nullptr;       // 将军（黑方/对面专用，来自视频）
     QSoundEffect *m_sndCheckRed = nullptr;    // 将军（红方/我方专用，原版合成音）

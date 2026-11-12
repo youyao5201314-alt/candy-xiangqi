@@ -1,4 +1,4 @@
-QT += core gui widgets multimedia
+QT += core gui widgets multimedia network
 
 CONFIG += c++17 utf8_source
 
@@ -9,12 +9,16 @@ TEMPLATE = app
 SOURCES += \
     main.cpp \
     MainWindow.cpp \
-    board.cpp
+    board.cpp \
+    NetworkManager.cpp \
+    StartScreen.cpp
 
 # 头文件
 HEADERS += \
     MainWindow.h \
-    board.h
+    board.h \
+    NetworkManager.h \
+    StartScreen.h
 
 # UI文件
 FORMS += \
@@ -25,10 +29,19 @@ FORMS += \
 RESOURCES += \
     sounds.qrc \
     avatar.qrc \
-    media.qrc
+    media.qrc \
+    videos.qrc
+
+# Windows exe 图标（两只猫戴耳机）
+win32:RC_FILE = app.rc
 
 # MSVC编译选项
 msvc {
     QMAKE_CXXFLAGS += /utf-8 /Zc:__cplusplus
     QMAKE_LFLAGS += /SUBSYSTEM:CONSOLE
+}
+
+# Android：自定义 Manifest（应用名等），目录结构与 Qt 模板一致
+android {
+    ANDROID_PACKAGE_SOURCE_DIR = $$PWD/android
 }

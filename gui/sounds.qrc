@@ -3,6 +3,7 @@
         <file>sounds/select.wav</file>
         <file>sounds/move.wav</file>
         <file>sounds/capture.wav</file>
+        <file>sounds/capture2.wav</file>
         <file>sounds/check.wav</file>
         <file>sounds/win.wav</file>
         <file>sounds/lose.wav</file>

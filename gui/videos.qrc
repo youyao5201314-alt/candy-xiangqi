@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/">
+        <file>videos/dragon_intro.gif</file>
+        <file>videos/dragon_intro.wav</file>
+    </qresource>
+</RCC>

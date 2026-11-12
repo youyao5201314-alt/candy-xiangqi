@@ -1,9 +1,13 @@
 #include "MainWindow.h"
 
+#include "NetworkManager.h"
+
 #include <QApplication>
 #include <QAudioOutput>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QDialog>
+#include <QDockWidget>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -14,6 +18,7 @@
 #include <QGraphicsDropShadowEffect>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QLineEdit>
 #include <QLineF>
 #include <QLinearGradient>
 #include <QMediaPlayer>
@@ -24,11 +29,16 @@
 #include <QPainterPath>
 #include <QPushButton>
 #include <QRadialGradient>
+#include <QRandomGenerator>
 #include <QRectF>
 #include <QSettings>
+#include <QShowEvent>
+#include <QSize>
 #include <QSlider>
+#include <QStandardPaths>
 #include <QStatusBar>
 #include <QSoundEffect>
+#include <QTextEdit>
 #include <QThread>
 #include <QUrl>
 #include <QTimer>
@@ -39,6 +49,87 @@
 #include "board.h"
 
 // ============================================================================
+// 奶龙登场动画：模态对话框，QMovie 播跳舞 gif + QSoundEffect 播配套音乐，
+// 播完或点跳过即关闭。不依赖系统 Media Foundation（部分机器 MF 播放 mp4
+// 会立刻报 EndOfMedia），gif/wav 全部直接走 qrc
+// ============================================================================
+namespace {
+
+class DragonVideoDialog : public QDialog
+{
+public:
+    explicit DragonVideoDialog(QWidget *parent)
+        : QDialog(parent)
+    {
+        setWindowTitle(QStringLiteral("奶龙登场！"));
+        setModal(true);
+        resize(520, 580);
+
+        auto *lay = new QVBoxLayout(this);
+        lay->setContentsMargins(0, 0, 0, 8);
+
+        m_scene = new QLabel(this);
+        m_scene->setAlignment(Qt::AlignCenter);
+        m_scene->setFixedSize(480, 480);   // 与 gif 同尺寸，画面正好铺满、四周不露底色
+        lay->addWidget(m_scene, 0, Qt::AlignHCenter);
+
+        auto *row = new QHBoxLayout();
+        row->setContentsMargins(10, 0, 10, 0);
+        auto *tip = new QLabel(QStringLiteral("奶龙登场中…"), this);
+        auto *skip = new QPushButton(QStringLiteral("跳过 >>"), this);
+        row->addWidget(tip);
+        row->addStretch();
+        row->addWidget(skip);
+        lay->addLayout(row);
+
+        m_movie = new QMovie(QStringLiteral(":/videos/dragon_intro.gif"), QByteArray(), this);
+        m_scene->setMovie(m_movie);
+
+        m_music = new QSoundEffect(this);
+        m_music->setSource(QUrl(QStringLiteral("qrc:/videos/dragon_intro.wav")));
+        m_music->setVolume(0.9f);
+
+        connect(skip, &QPushButton::clicked, this, [this]() { accept(); });
+
+        // gif 最后一帧稍停即关闭（gif 约 5 秒，与 wav 等长）
+        connect(m_movie, &QMovie::frameChanged, this, [this](int frameNo) {
+            const int total = m_movie->frameCount();
+            if (!m_finishing && total > 0 && frameNo >= total - 1) {
+                m_finishing = true;
+                QTimer::singleShot(200, this, &QDialog::accept);
+            }
+        });
+        // 兜底：素材异常时最多 9 秒自动关
+        QTimer::singleShot(9000, this, [this]() { accept(); });
+    }
+
+    void showEvent(QShowEvent *ev) override
+    {
+        QDialog::showEvent(ev);
+        if (!m_started) {
+            m_started = true;
+            m_movie->start();
+            m_music->play();
+        }
+    }
+
+    ~DragonVideoDialog() override
+    {
+        m_music->stop();
+        m_movie->stop();
+    }
+
+private:
+    QLabel *m_scene;
+    QMovie *m_movie;
+    QSoundEffect *m_music;
+    bool m_started = false;
+    bool m_finishing = false;
+};
+
+} // namespace
+
+// ============================================================================
 // 棋盘几何：所有渲染和“像素 <-> 棋盘坐标”换算的唯一数据源
 // 棋盘 9 列 10 行交叉点；棋子摆在交叉点上。
 // ============================================================================
@@ -46,7 +137,11 @@ namespace {
 
 constexpr int kRows = 10;
 constexpr int kCols = 9;
+#ifdef Q_OS_ANDROID
+constexpr qreal kMargin = 14.0;   // 手机屏幕窄，棋盘外沿留白收小
+#else
 constexpr qreal kMargin = 30.0;   // 棋盘外沿留白（炮位/兵位小十字需要空间）
+#endif
 
 struct Geo {
     qreal ox;     // 左上角交叉点 x
@@ -158,7 +253,11 @@ void drawCornerTicks(QPainter &p, const Geo &g, int row, int col)
 BoardView::BoardView(MainWindow *win, QWidget *parent)
     : QWidget(parent), m_win(win)
 {
+#ifdef Q_OS_ANDROID
+    setMinimumSize(0, 0);   // 手机上让棋盘自由填满剩余空间
+#else
     setMinimumSize(480, 540);
+#endif
     setAttribute(Qt::WA_OpaquePaintEvent, true);
 }
 
@@ -179,16 +278,29 @@ void BoardView::mousePressEvent(QMouseEvent *event)
 // ============================================================================
 // MainWindow
 // ============================================================================
-MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent)
+MainWindow::MainWindow(GameMode mode, bool isHost, NetworkManager *net, QWidget *parent)
+    : QMainWindow(parent), m_mode(mode), m_isHost(isHost), m_net(net)
 {
-    setWindowTitle(QStringLiteral("中国象棋 - candyboard"));
+    // 联机模式：房主执红先手，加入者执黑后手
+    if (m_mode == GameMode::Online) {
+        m_playerRed = isHost;
+        m_myTurn = m_playerRed;   // 红方先走
+    }
+
+    setWindowTitle(m_mode == GameMode::Online
+                       ? QStringLiteral("中国象棋 - 联机对战")
+                       : QStringLiteral("中国象棋 - candyboard"));
 
     // 顶部按钮行 + 棋盘
     auto *central = new QWidget(this);
     auto *root = new QVBoxLayout(central);
+#ifdef Q_OS_ANDROID
+    root->setContentsMargins(4, 4, 4, 0);
+    root->setSpacing(2);
+#else
     root->setContentsMargins(8, 8, 8, 0);
     root->setSpacing(6);
+#endif
 
     auto *btnRow = new QHBoxLayout();
     m_restartBtn = new QPushButton(QStringLiteral("重新开局"), central);
@@ -197,8 +309,21 @@ MainWindow::MainWindow(QWidget *parent)
     btnRow->addWidget(m_restartBtn);
     btnRow->addWidget(m_undoBtn);
     btnRow->addWidget(m_resignBtn);
+    // 联机房主专属：召唤奶龙给走子建议（不替你落子）
+    if (m_mode == GameMode::Online && m_isHost) {
+        m_summonBtn = new QPushButton(QStringLiteral("🐲 奶娃助阵"), central);
+        btnRow->addWidget(m_summonBtn);
+        // 挂机按钮：奶龙登场后才出现
+        m_afkBtn = new QPushButton(QStringLiteral("🥱 奶娃挂机"), central);
+        m_afkBtn->setVisible(false);
+        btnRow->addWidget(m_afkBtn);
+    }
     btnRow->addSpacing(16);
+#ifdef Q_OS_ANDROID
+    btnRow->addWidget(new QLabel(QStringLiteral("难度："), central));
+#else
     btnRow->addWidget(new QLabel(QStringLiteral("AI 难度："), central));
+#endif
     m_levelCombo = new QComboBox(central);   // 必须先 new 出下拉框，才能往里 addItem
     m_levelCombo->addItem(QStringLiteral("笨糖果（10 秒）"), 10000);
     m_levelCombo->addItem(QStringLiteral("一般糖果（15 秒）"), 15000);
@@ -209,6 +334,7 @@ MainWindow::MainWindow(QWidget *parent)
     root->addLayout(btnRow);
 
     // 第二行：背景 / 音乐 / 音量 / 先后手
+    // 手机竖屏宽度不够，Android 上把“音量/执子”拆到第三行
     auto *optRow = new QHBoxLayout();
     optRow->addWidget(new QLabel(QStringLiteral("背景："), central));
     m_bgCombo = new QComboBox(central);
@@ -227,80 +353,175 @@ MainWindow::MainWindow(QWidget *parent)
     m_musicCombo->addItem(QStringLiteral("Take Me Hand"));
     m_musicCombo->addItem(QStringLiteral("自定义…"));
     optRow->addWidget(m_musicCombo);
+#ifdef Q_OS_ANDROID
+    // 收起时按较短宽度显示，点开下拉仍能看到完整曲名
+    m_bgCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_musicCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_bgCombo->setMinimumContentsLength(4);
+    m_musicCombo->setMinimumContentsLength(8);
+    optRow->addStretch();
+    root->addLayout(optRow);
 
+    auto *optRow2 = new QHBoxLayout();
+#else
     optRow->addSpacing(12);
-    optRow->addWidget(new QLabel(QStringLiteral("音量："), central));
+#endif
+    auto *volLabel = new QLabel(QStringLiteral("音量："), central);
     m_volSlider = new QSlider(Qt::Horizontal, central);
     m_volSlider->setRange(0, 100);
     m_volSlider->setValue(50);
     m_volSlider->setFixedWidth(110);
-    optRow->addWidget(m_volSlider);
-
-    optRow->addSpacing(12);
-    optRow->addWidget(new QLabel(QStringLiteral("执子："), central));
+    auto *sideLabel = new QLabel(QStringLiteral("执子："), central);
     m_sideCombo = new QComboBox(central);
     m_sideCombo->addItem(QStringLiteral("先手（执红）"));
     m_sideCombo->addItem(QStringLiteral("后手（执黑）"));
+#ifdef Q_OS_ANDROID
+    optRow2->addWidget(volLabel);
+    optRow2->addWidget(m_volSlider);
+    optRow2->addSpacing(12);
+    optRow2->addWidget(sideLabel);
+    optRow2->addWidget(m_sideCombo);
+    optRow2->addStretch();
+    root->addLayout(optRow2);
+#else
+    optRow->addWidget(volLabel);
+    optRow->addWidget(m_volSlider);
+    optRow->addSpacing(12);
+    optRow->addWidget(sideLabel);
     optRow->addWidget(m_sideCombo);
     optRow->addStretch();
     root->addLayout(optRow);
+#endif
 
-    // 背景音乐播放器（循环播放）
-    m_audioOut = new QAudioOutput(this);
-    m_audioOut->setVolume(0.5f);
-    m_musicPlayer = new QMediaPlayer(this);
-    m_musicPlayer->setAudioOutput(m_audioOut);
-    m_musicPlayer->setLoops(QMediaPlayer::Infinite);
+    // 背景音乐播放器：QMediaPlayer/QAudioOutput 构造会同步初始化 Media
+    // Foundation/WASAPI，耗时数秒——不在构造或窗口显示后创建（会卡点击、
+    // 也会把事件循环堵到窗口假死），而是首次真正播放音乐时才懒加载
+    // （ensureMusicPlayer 幂等；onMusicChanged / summonDragon 入口已兜底）
 
     connect(m_bgCombo, &QComboBox::currentIndexChanged, this, &MainWindow::onBgChanged);
     connect(m_musicCombo, &QComboBox::currentIndexChanged, this, &MainWindow::onMusicChanged);
     connect(m_sideCombo, &QComboBox::currentIndexChanged, this, &MainWindow::onSideChanged);
     // 音量滑条 0-100 -> 0.0-1.0
     connect(m_volSlider, &QSlider::valueChanged, this, [this](int v) {
-        m_audioOut->setVolume(v / 100.0f);
+        if (m_audioOut)
+            m_audioOut->setVolume(v / 100.0f);
     });
 
     m_view = new BoardView(this, central);
 
-    // 右侧：对面虚拟形象面板（伪3D卡片）
+    // 右侧：虚拟形象面板（单机=AI 对面；联机=奶娃帮手）
     initAvatar();
     auto *contentRow = new QHBoxLayout();
     contentRow->setSpacing(8);
     contentRow->addWidget(m_view, 1);
 
-    auto *avatarFrame = new QFrame(central);
-    avatarFrame->setObjectName(QStringLiteral("avatarFrame"));
-    avatarFrame->setStyleSheet(QStringLiteral(
+    m_avatarPanel = new QFrame(central);
+    m_avatarPanel->setObjectName(QStringLiteral("avatarFrame"));
+    m_avatarPanel->setStyleSheet(QStringLiteral(
         "QFrame#avatarFrame {"
         "  background: qlineargradient(x1:0, y1:0, x2:0.4, y2:1,"
         "    stop:0 #fffdf4, stop:0.55 #ffe9b8, stop:1 #e7c07f);"
         "  border: 2px solid #8a5a2a; border-radius: 14px;"
         "}"));
     // 投影：让卡片浮起来，营造伪3D感
-    auto *shadow = new QGraphicsDropShadowEffect(avatarFrame);
+    auto *shadow = new QGraphicsDropShadowEffect(m_avatarPanel);
     shadow->setBlurRadius(18);
     shadow->setOffset(0, 5);
     shadow->setColor(QColor(60, 36, 10, 110));
-    avatarFrame->setGraphicsEffect(shadow);
+    m_avatarPanel->setGraphicsEffect(shadow);
 
-    auto *avatarCol = new QVBoxLayout(avatarFrame);
-    avatarCol->setContentsMargins(12, 12, 12, 12);
-    avatarCol->setSpacing(6);
-    auto *nameLabel = new QLabel(QStringLiteral("奶娃"), avatarFrame);
+    auto *nameLabel = new QLabel(
+        m_mode == GameMode::Online ? QStringLiteral("奶娃帮手") : QStringLiteral("奶娃"),
+        m_avatarPanel);
     nameLabel->setAlignment(Qt::AlignCenter);
     QFont nameFont = nameLabel->font();
     nameFont.setBold(true);
     nameLabel->setFont(nameFont);
+#ifdef Q_OS_ANDROID
+    // 手机：形象面板压缩为顶部横向小条（图 48x48 + 名字/心情），把宽度让给棋盘
+    m_avatarImg->setFixedSize(48, 48);
+    m_avatarMovie->setScaledSize(QSize(48, 48));
+    auto *avatarBar = new QHBoxLayout(m_avatarPanel);
+    avatarBar->setContentsMargins(8, 2, 8, 2);
+    avatarBar->setSpacing(8);
+    auto *avatarText = new QVBoxLayout();
+    avatarText->setSpacing(0);
+    avatarText->addWidget(nameLabel);
+    avatarText->addWidget(m_avatarMood);
+    avatarBar->addWidget(m_avatarImg, 0, Qt::AlignVCenter);
+    avatarBar->addLayout(avatarText, 1);
+    m_avatarMood->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    m_avatarPanel->setFixedHeight(56);
+    root->addWidget(m_avatarPanel);
+#else
+    auto *avatarCol = new QVBoxLayout(m_avatarPanel);
+    avatarCol->setContentsMargins(12, 12, 12, 12);
+    avatarCol->setSpacing(6);
     avatarCol->addWidget(nameLabel);
     avatarCol->addWidget(m_avatarImg, 0, Qt::AlignCenter);
     avatarCol->addWidget(m_avatarMood);
     avatarCol->addStretch();
-    avatarFrame->setFixedWidth(200);
-    contentRow->addWidget(avatarFrame);
+    m_avatarPanel->setFixedWidth(200);
+    contentRow->addWidget(m_avatarPanel);
+#endif
+
+    // 联机：奶娃形象默认隐藏，房主点"奶娃助阵"召唤后才出现（对面同步出现帮手条）
+    if (m_mode == GameMode::Online)
+        m_avatarPanel->setVisible(false);
+
+    // 联机加入者：不显示右侧形象卡片，改为在棋盘上方（本方执黑时显示旋转
+    // 180°，房主/红方阵地在屏幕上部）放一条“奶娃帮手”横条；房主召唤奶娃
+    // 后出现，思考/打人等状态由房主端实时同步
+    if (m_mode == GameMode::Online && !m_isHost) {
+        m_avatarPanel->setVisible(false);
+        m_peerBar = new QFrame(central);
+        m_peerBar->setObjectName(QStringLiteral("peerBar"));
+        m_peerBar->setStyleSheet(QStringLiteral(
+            "QFrame#peerBar {"
+            "  background: qlineargradient(x1:0, y1:0, x2:0.4, y2:1,"
+            "    stop:0 #fffdf4, stop:0.55 #ffe9b8, stop:1 #e7c07f);"
+            "  border: 2px solid #8a5a2a; border-radius: 10px;"
+            "}"));
+        m_peerImg = new QLabel(m_peerBar);
+        m_peerImg->setFixedSize(48, 48);
+        m_peerImg->setAlignment(Qt::AlignCenter);
+        auto *peerName = new QLabel(QStringLiteral("奶娃帮手"), m_peerBar);
+        QFont peerFont = peerName->font();
+        peerFont.setBold(true);
+        peerName->setFont(peerFont);
+        m_peerMood = new QLabel(m_peerBar);
+        m_peerMood->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+        m_peerMovie = new QMovie(QStringLiteral(":/avatar/action.gif"), QByteArray(), m_peerBar);
+        m_peerMovie->setCacheMode(QMovie::CacheAll);
+        m_peerMovie->setScaledSize(QSize(48, 48));
+        m_peerMovie2 = new QMovie(QStringLiteral(":/avatar/action2.gif"), QByteArray(), m_peerBar);
+        m_peerMovie2->setCacheMode(QMovie::CacheAll);
+        connect(m_peerMovie2, &QMovie::frameChanged, this, [this]() {
+            if (m_peerMovie2->state() == QMovie::Running) {
+                m_peerImg->setPixmap(m_peerMovie2->currentPixmap().scaled(
+                    m_peerImg->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+            }
+        });
+        auto *peerLay = new QHBoxLayout(m_peerBar);
+        peerLay->setContentsMargins(10, 4, 10, 4);
+        peerLay->setSpacing(8);
+        auto *peerText = new QVBoxLayout();
+        peerText->setSpacing(0);
+        peerText->addWidget(peerName);
+        peerText->addWidget(m_peerMood);
+        peerLay->addWidget(m_peerImg, 0, Qt::AlignVCenter);
+        peerLay->addLayout(peerText, 1);
+        m_peerBar->setFixedHeight(64);
+        m_peerBar->setVisible(false);
+        root->addWidget(m_peerBar);
+    }
+
     root->addLayout(contentRow, 1);
 
     setCentralWidget(central);
+#ifndef Q_OS_ANDROID
     resize(920, 700);   // 加宽以容纳第二行选项（背景/音乐/音量/执子）
+#endif
 
     connect(m_restartBtn, &QPushButton::clicked, this, &MainWindow::restartGame);
     connect(m_undoBtn, &QPushButton::clicked, this, &MainWindow::undoMove);
@@ -322,13 +543,81 @@ MainWindow::MainWindow(QWidget *parent)
 
     statusBar()->showMessage(QStringLiteral("红方走棋（你执红先行）"));
 
-    initSounds();   // 必须在开局前预加载，否则第一声会因异步加载而哑火
+    initSounds();   // 只创建音效对象；资源加载延后（见下）
+    // 音频后端初始化（setSource）是同步耗时操作，9 个音效连着做会明显拖慢
+    // "开始游戏"点击。挪到窗口显示后的第一轮事件循环，弹窗立刻、声音稍后到位。
+    QTimer::singleShot(0, this, &MainWindow::loadSoundSources);
     loadCustomAssets();   // 恢复上次用过的自定义背景/音乐
     initBoard();
     resetGameHash();
     resetKillerAndHistory();
     setAvatar(AvatarState::Idle);
     refreshButtons();
+
+    // ===== 联机模式专属设置 =====
+    if (m_mode == GameMode::Online) {
+        // 联机没有AI，把难度和执子选择藏起来
+        m_levelCombo->hide();
+        m_sideCombo->hide();
+        // 找到对应的标签也隐藏（难度、执子）
+        const auto labels = findChildren<QLabel*>();
+        for (QLabel *l : labels) {
+            if (l->text().contains(QStringLiteral("难度")) || l->text().contains(QStringLiteral("执子")))
+                l->hide();
+        }
+
+        // 右侧聊天面板（停靠窗口，可拖动；不可关闭，防止关掉后没法聊天）
+        auto *chatDock = new QDockWidget(QStringLiteral("房间聊天"), this);
+        chatDock->setAllowedAreas(Qt::RightDockWidgetArea | Qt::LeftDockWidgetArea);
+        chatDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+        auto *chatWidget = new QWidget(chatDock);
+        auto *chatLayout = new QVBoxLayout(chatWidget);
+        m_chatView = new QTextEdit(chatWidget);
+        m_chatView->setReadOnly(true);
+        m_chatInput = new QLineEdit(chatWidget);
+        m_chatInput->setPlaceholderText(QStringLiteral("输入消息，回车发送…"));
+        auto *sendBtn = new QPushButton(QStringLiteral("发送"), chatWidget);
+        auto *inputRow = new QHBoxLayout();
+        inputRow->addWidget(m_chatInput, 1);
+        inputRow->addWidget(sendBtn);
+        chatLayout->addWidget(m_chatView, 1);
+        chatLayout->addLayout(inputRow);
+        chatDock->setWidget(chatWidget);
+        addDockWidget(Qt::RightDockWidgetArea, chatDock);
+
+        connect(sendBtn, &QPushButton::clicked, this, &MainWindow::sendChatMessage);
+        connect(m_chatInput, &QLineEdit::returnPressed, this, &MainWindow::sendChatMessage);
+
+        if (m_summonBtn)
+            connect(m_summonBtn, &QPushButton::clicked, this, &MainWindow::summonDragon);
+        if (m_afkBtn)
+            connect(m_afkBtn, &QPushButton::clicked, this, &MainWindow::toggleAfk);
+
+        // 连接网络信号
+        if (m_net) {
+            connect(m_net, &NetworkManager::moveReceived, this, &MainWindow::onNetworkMoveReceived);
+            connect(m_net, &NetworkManager::chatReceived, this, &MainWindow::onNetworkChatReceived);
+            connect(m_net, &NetworkManager::avatarReceived, this, &MainWindow::onNetworkAvatar);
+            connect(m_net, &NetworkManager::versionReceived, this, &MainWindow::onNetworkVersion);
+            connect(m_net, &NetworkManager::undoRequested, this, &MainWindow::onNetworkUndoRequest);
+            connect(m_net, &NetworkManager::undoAnswered, this, &MainWindow::onNetworkUndoAnswer);
+            connect(m_net, &NetworkManager::restartRequested, this, &MainWindow::onNetworkRestartRequest);
+            connect(m_net, &NetworkManager::restartAnswered, this, &MainWindow::onNetworkRestartAnswer);
+            connect(m_net, &NetworkManager::badMoveReceived, this, &MainWindow::onNetworkBadMove);
+            connect(m_net, &NetworkManager::disconnected, this, &MainWindow::onPeerDisconnected);
+        }
+
+        // 版本握手：双方窗口都建好后再互报版本（延迟一点，保证对方已挂上信号）
+        QTimer::singleShot(800, this, [this]() {
+            if (m_net)
+                m_net->sendVersion(QStringLiteral("3.1.1"));
+        });
+
+        // 状态栏提示：房主执红先走，加入者执黑等待
+        statusBar()->showMessage(m_playerRed
+            ? QStringLiteral("联机对战：你执红先行")
+            : QStringLiteral("联机对战：你执黑，等待红方先走…"));
+    }
 }
 
 MainWindow::~MainWindow()
@@ -339,23 +628,52 @@ MainWindow::~MainWindow()
     delete m_thinkClock;
 }
 
+// 懒加载背景音乐播放器：真正的创建延后到窗口显示后（见构造函数）
+void MainWindow::ensureMusicPlayer()
+{
+    if (m_musicPlayer)
+        return;
+    m_audioOut = new QAudioOutput(this);
+    m_audioOut->setVolume(m_volSlider ? m_volSlider->value() / 100.0f : 0.5f);
+    m_musicPlayer = new QMediaPlayer(this);
+    m_musicPlayer->setAudioOutput(m_audioOut);
+    m_musicPlayer->setLoops(QMediaPlayer::Infinite);
+}
+
 // 预加载音效：wav 已编进 qrc，程序启动时一次性载入内存，点击即播无延迟
 void MainWindow::initSounds()
 {
-    auto mk = [this](const QString &file, float vol) {
+    // 只创建对象并设音量；setSource（真正触发音频后端初始化，较慢）
+    // 统一延后到 loadSoundSources()，避免卡住"开始游戏"的点击响应
+    auto mk = [this](float vol) {
         auto *s = new QSoundEffect(this);
-        s->setSource(QUrl(QStringLiteral("qrc:/sounds/") + file));
         s->setVolume(vol);
         return s;
     };
-    m_sndSelect     = mk(QStringLiteral("select.wav"),      0.5f);
-    m_sndMove       = mk(QStringLiteral("move.wav"),        0.6f);
-    m_sndCapture    = mk(QStringLiteral("capture.wav"),     0.6f);   // 黑方/对面吃子（视频提取）
-    m_sndCaptureRed = mk(QStringLiteral("capture_red.wav"), 0.6f);   // 红方/我方吃子（原版合成）
-    m_sndCheck      = mk(QStringLiteral("check.wav"),       0.6f);   // 黑方/对面将军（视频提取）
-    m_sndCheckRed   = mk(QStringLiteral("check_red.wav"),   0.6f);   // 红方/我方将军（原版合成）
-    m_sndWin        = mk(QStringLiteral("win.wav"),         0.6f);
-    m_sndLose       = mk(QStringLiteral("lose.wav"),        0.6f);   // 黑方胜利/投降大笑（视频提取）
+    m_sndSelect     = mk(0.5f);
+    m_sndMove       = mk(0.6f);
+    m_sndCapture    = mk(0.6f);   // 黑方/对面吃子（视频提取）
+    m_sndCapture2   = mk(0.8f);   // 挂机奶娃吃子随机音效（视频2提取）
+    m_sndCaptureRed = mk(0.6f);   // 红方/我方吃子（原版合成）
+    m_sndCheck      = mk(0.6f);   // 黑方/对面将军（视频提取）
+    m_sndCheckRed   = mk(0.6f);   // 红方/我方将军（原版合成）
+    m_sndWin        = mk(0.6f);
+    m_sndLose       = mk(0.6f);   // 黑方胜利/投降大笑（视频提取）
+}
+
+// 给音效绑定资源：在窗口显示后的第一轮事件循环里执行
+// （玩家最快也要几百毫秒后才落第一子，此时早已加载完毕，听感无差异）
+void MainWindow::loadSoundSources()
+{
+    m_sndSelect->setSource(QUrl(QStringLiteral("qrc:/sounds/select.wav")));
+    m_sndMove->setSource(QUrl(QStringLiteral("qrc:/sounds/move.wav")));
+    m_sndCapture->setSource(QUrl(QStringLiteral("qrc:/sounds/capture.wav")));
+    m_sndCapture2->setSource(QUrl(QStringLiteral("qrc:/sounds/capture2.wav")));
+    m_sndCaptureRed->setSource(QUrl(QStringLiteral("qrc:/sounds/capture_red.wav")));
+    m_sndCheck->setSource(QUrl(QStringLiteral("qrc:/sounds/check.wav")));
+    m_sndCheckRed->setSource(QUrl(QStringLiteral("qrc:/sounds/check_red.wav")));
+    m_sndWin->setSource(QUrl(QStringLiteral("qrc:/sounds/win.wav")));
+    m_sndLose->setSource(QUrl(QStringLiteral("qrc:/sounds/lose.wav")));
 }
 
 // 初始化对面虚拟形象：图片标签 + 心情文字 + gif 动图 + 反应定时器
@@ -374,6 +692,17 @@ void MainWindow::initAvatar()
     m_avatarMovie = new QMovie(QStringLiteral(":/avatar/action.gif"), QByteArray(), this);
     m_avatarMovie->setCacheMode(QMovie::CacheAll);
 
+    // 挂机奶娃吃子时随机播放的新版出拳动作（240x240，比头像框大，
+    // 不能直接 setMovie，改为监听帧变化、缩放后用 pixmap 上屏）
+    m_avatarMovie2 = new QMovie(QStringLiteral(":/avatar/action2.gif"), QByteArray(), this);
+    m_avatarMovie2->setCacheMode(QMovie::CacheAll);
+    connect(m_avatarMovie2, &QMovie::frameChanged, this, [this]() {
+        if (m_avatarMovie2->state() == QMovie::Running) {
+            m_avatarImg->setPixmap(m_avatarMovie2->currentPixmap().scaled(
+                m_avatarImg->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        }
+    });
+
     m_avatarTimer = new QTimer(this);
     m_avatarTimer->setSingleShot(true);
     connect(m_avatarTimer, &QTimer::timeout, this, &MainWindow::onAvatarTimer);
@@ -381,13 +710,19 @@ void MainWindow::initAvatar()
 
 // 切换形象：静态图直接换 pixmap；Action 状态播 gif
 // 音乐开启时锁定为听歌脸，拒绝任何切换（但 Listening 自己放行）
+// 联机加入者：形象条完全由房主端同步驱动，本地事件不改变它
 void MainWindow::setAvatar(AvatarState s)
 {
+    if (m_mode == GameMode::Online && !m_isHost)
+        return;
     if (m_musicOn && s != AvatarState::Listening)
         s = AvatarState::Listening;
     m_avatarState = s;
+    syncAvatar(stateKey(s));   // 房主：把奶娃状态广播给对面（其余情况为空操作）
 
     if (s == AvatarState::Action && m_avatarMovie->isValid()) {
+        if (m_avatarMovie2->state() == QMovie::Running)
+            m_avatarMovie2->stop();
         m_avatarImg->setMovie(m_avatarMovie);
         m_avatarMovie->start();
         m_avatarMood->setText(QStringLiteral("看我反击！"));
@@ -441,6 +776,8 @@ void MainWindow::setAvatar(AvatarState s)
 
     if (m_avatarMovie->state() == QMovie::Running)
         m_avatarMovie->stop();
+    if (m_avatarMovie2 && m_avatarMovie2->state() == QMovie::Running)
+        m_avatarMovie2->stop();
     m_avatarImg->setPixmap(QPixmap(QStringLiteral(":/avatar/") + file)
         .scaled(m_avatarImg->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     m_avatarMood->setText(mood);
@@ -507,10 +844,13 @@ void MainWindow::revertStep(const Step &s)
 
 void MainWindow::refreshButtons()
 {
-    m_undoBtn->setEnabled(!m_history.empty() && !m_aiThinking);
-    m_restartBtn->setEnabled(!m_aiThinking);
-    m_levelCombo->setEnabled(!m_aiThinking);
-    m_sideCombo->setEnabled(!m_aiThinking);
+    const bool online = (m_mode == GameMode::Online);
+    // 单机：悔棋需有历史、重开无限制；联机：悔棋/重开/投降都随时可点（消息发出去等对面确认）
+    m_undoBtn->setEnabled(!m_aiThinking && !m_waitingUndo
+                          && (online ? true : !m_history.empty()));
+    m_restartBtn->setEnabled(!m_aiThinking && !m_waitingRestart);
+    m_levelCombo->setEnabled(!online && !m_aiThinking);
+    m_sideCombo->setEnabled(!online && !m_aiThinking);
     m_resignBtn->setEnabled(!m_gameOver && !m_aiThinking);
 }
 
@@ -567,6 +907,12 @@ void MainWindow::restartGame()
     if (m_aiThinking)
         return;
 
+    // 联机：不直接重开，发请求等对方同意（保证两边棋盘同步重置）
+    if (m_mode == GameMode::Online) {
+        sendRestartRequest();
+        return;
+    }
+
     initBoard();
     resetGameHash();
     resetKillerAndHistory();
@@ -589,6 +935,12 @@ void MainWindow::undoMove()
 {
     if (m_history.empty() || m_aiThinking)
         return;
+
+    // 联机：不直接悔棋，发请求等对方同意（保证两边棋盘同步回退）
+    if (m_mode == GameMode::Online) {
+        sendUndoRequest();
+        return;
+    }
 
     // 对面抱头震惊，同时弹确认框
     m_avatarTimer->stop();
@@ -663,10 +1015,16 @@ void MainWindow::logicalPt(int row, int col, int &lr, int &lc) const
     displayPt(row, col, lr, lc);
 }
 
-// 把用户选择的文件复制到 exe 旁 assets/ 目录（防止源文件被移动/删除后失效）
+// 把用户选择的文件复制到应用私有 assets/ 目录（防止源文件被移动/删除后失效）
+// 桌面版放在 exe 旁；Android 上 APK 安装目录只读，改用 AppDataLocation
 QString MainWindow::copyToAssets(const QString &src, const QString &tag)
 {
-    QDir dir(QCoreApplication::applicationDirPath() + QStringLiteral("/assets"));
+#ifdef Q_OS_ANDROID
+    const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+#else
+    const QString base = QCoreApplication::applicationDirPath();
+#endif
+    QDir dir(base + QStringLiteral("/assets"));
     if (!dir.exists() && !dir.mkpath(QStringLiteral(".")))
         return QString();
     const QString dst = dir.filePath(tag + QStringLiteral(".") + QFileInfo(src).suffix());
@@ -781,6 +1139,7 @@ void MainWindow::onBgChanged(int index)
 // 开启时：形象锁定为听歌脸、所有音效静音；关闭时恢复正常
 void MainWindow::onMusicChanged(int index)
 {
+    ensureMusicPlayer();   // 播放器懒加载兜底（正常已在窗口显示后建好）
     if (index == 4) {
         // 已有保存的自定义音乐：询问直接用 / 重新上传 / 删除
         bool needPick = m_customMusicPath.isEmpty();
@@ -920,6 +1279,10 @@ void MainWindow::startAiThinking()
 void MainWindow::onAiTick()
 {
     const double sec = m_thinkClock->elapsed() / 1000.0;
+    if (m_afk) {
+        statusBar()->showMessage(QStringLiteral("🐲 奶娃思考中… %1 秒").arg(sec, 0, 'f', 1));
+        return;
+    }
     const QString side = m_playerRed ? QStringLiteral("黑方") : QStringLiteral("红方");
     statusBar()->showMessage(side + QStringLiteral("思考中… %1 秒").arg(sec, 0, 'f', 1));
 }
@@ -991,6 +1354,9 @@ void MainWindow::handleBoardPress(const QPoint &pos, const QSize &viewSize,
 {
     if (m_aiThinking)
         return;
+    // 联机模式：不是我的回合，棋盘锁定（右键仍可取消选中）
+    if (m_mode == GameMode::Online && !m_myTurn && !rightButton)
+        return;
 
     const Geo g = makeGeo(viewSize);
     int row = -1, col = -1;
@@ -1025,6 +1391,9 @@ void MainWindow::handleBoardPress(const QPoint &pos, const QSize &viewSize,
         } else {
             // 先记下目标点上的子（movePiece 成功后该位置会被覆盖）
             const int captured = coreBoard[row][col];
+            // 起点坐标先存局部：后面 clearSelection() 会把 m_selRow/m_selCol 清成 -1，
+            // 联机发送必须用这里保存的合法坐标（修复：手动走棋发 MOVE -1,-1 的 bug）
+            const int fromRow = m_selRow, fromCol = m_selCol;
 
             // 尝试走子（movePiece 内部校验走法、将帅对脸、送将）
             if (!movePiece(m_selRow, m_selCol, row, col)) {
@@ -1034,7 +1403,7 @@ void MainWindow::handleBoardPress(const QPoint &pos, const QSize &viewSize,
 
             // ---- 玩家落子成立，记入历史 ----
             Step playerStep;
-            playerStep.move = Move(m_selRow, m_selCol, row, col);
+            playerStep.move = Move(fromRow, fromCol, row, col);
             playerStep.piece = coreBoard[row][col];
             playerStep.captured = captured;
             playerStep.byRed = m_playerRed;
@@ -1057,6 +1426,15 @@ void MainWindow::handleBoardPress(const QPoint &pos, const QSize &viewSize,
             updateCheckState();
             m_view->update();
 
+            // ---- 联机：无论这步是否终局都必须先发给对方——
+            // 若将死/困毙后才 return，消息永远发不出，对方棋盘会卡死等这步 ----
+            if (m_mode == GameMode::Online) {
+                m_myTurn = false;
+                if (m_net)
+                    m_net->sendMove(fromRow, fromCol, row, col);
+                statusBar()->showMessage(QStringLiteral("已走子，等待对方…"));
+            }
+
             if (aiState != 0) {
                 const QString kill = QString::fromLocal8Bit(
                     getKillTypeName(coreBoard, aiRed).c_str());
@@ -1076,15 +1454,19 @@ void MainWindow::handleBoardPress(const QPoint &pos, const QSize &viewSize,
                 return;
             }
 
-            // ---- AI 后台应招（按难度 10/15/20 秒）----
-            // 玩家将军且未吃子（吃子已播愤怒序列）：对面点赞 0.9 秒再思考
-            const bool aiInCheck = m_playerRed ? m_blackInCheck : m_redInCheck;
-            if (captured == 0 && aiInCheck) {
-                m_avatarTimer->stop();
-                setAvatar(AvatarState::GoodMove);
-                m_avatarTimer->start(900);
+            if (m_mode == GameMode::Online) {
+                // 走子已发，等对方走（m_myTurn 已置 false）
+            } else {
+                // ---- 单机：AI 后台应招（按难度 10/15/20 秒）----
+                // 玩家将军且未吃子（吃子已播愤怒序列）：对面点赞 0.9 秒再思考
+                const bool aiInCheck = m_playerRed ? m_blackInCheck : m_redInCheck;
+                if (captured == 0 && aiInCheck) {
+                    m_avatarTimer->stop();
+                    setAvatar(AvatarState::GoodMove);
+                    m_avatarTimer->start(900);
+                }
+                startAiThinking();
             }
-            startAiThinking();
         }
     }
     m_view->update();
@@ -1261,3 +1643,547 @@ void MainWindow::renderBoard(QPainter &p, const QSize &viewSize)
         }
     }
 }
+
+// ============================================================================
+// 联机模式：收到对方走子 → 在本机棋盘上落子
+// ============================================================================
+void MainWindow::onNetworkMoveReceived(int x1, int y1, int x2, int y2)
+{
+    if (m_mode != GameMode::Online)
+        return;
+    // 防御：坐标必须在棋盘内，否则 coreBoard 负/越界下标是未定义行为
+    if (x1 < 0 || x1 > 9 || y1 < 0 || y1 > 8 || x2 < 0 || x2 > 9 || y2 < 0 || y2 > 8)
+        return;
+
+    const Move opp(x1, y1, x2, y2);
+    Step oppStep;
+    oppStep.captured = coreBoard[x2][y2];
+    oppStep.piece = coreBoard[x1][y1];
+    executeMove(opp);        // 对方已在自己棋盘上校验过，直接落子
+    oppStep.move = opp;
+    oppStep.byRed = !m_playerRed;   // 对方走的是我方对面的颜色
+    m_history.push_back(oppStep);
+    m_last = opp;
+    m_hasLast = true;
+
+    // 对方吃子用对面音效，普通走动用木质落子声
+    (oppStep.captured != 0 ? m_sndCapture : m_sndMove)->play();
+
+    // 判终局
+    const int myState = checkGameOver(coreBoard, m_playerRed);
+    if (myState != 0)
+        m_gameOver = true;
+    updateCheckState();
+    m_myTurn = true;   // 对方走完，轮到我
+    m_view->update();
+
+    if (myState != 0) {
+        const QString kill = QString::fromLocal8Bit(
+            getKillTypeName(coreBoard, m_playerRed).c_str());
+        const QString reason = (myState == 1)
+            ? QStringLiteral("你被将死")
+            : QStringLiteral("你无子可动（困毙）");
+        statusBar()->showMessage(QStringLiteral("对方胜利！") + reason);
+        m_animTimer->stop();
+        m_sndLose->play();
+        QMessageBox::information(this,
+            QStringLiteral("对局结束"),
+            QStringLiteral("对方胜利！\n%1\n杀法：%2").arg(reason, kill));
+    } else {
+        statusBar()->showMessage(m_playerRed
+            ? QStringLiteral("红方走棋（轮到你了）")
+            : QStringLiteral("黑方走棋（轮到你了）"));
+        // 挂机中：稍等半秒（留个"停止挂机"的窗口），奶娃自动出手
+        if (m_afk) {
+            QTimer::singleShot(500, this, [this]() { startAfkMove(); });
+        }
+    }
+    refreshButtons();
+}
+
+// ============================================================================
+// 联机模式：收到对方聊天
+// ============================================================================
+void MainWindow::onNetworkChatReceived(const QString &text)
+{
+    if (!m_chatView)
+        return;
+    m_chatView->append(QStringLiteral("<b style='color:#c0392b'>对方：</b>") + text.toHtmlEscaped());
+}
+
+// ============================================================================
+// 联机：奶娃状态同步（房主端广播 → 加入者底部“奶娃帮手”条呈现）
+// ============================================================================
+QString MainWindow::stateKey(AvatarState s) const
+{
+    switch (s) {
+    case AvatarState::Idle:       return QStringLiteral("idle");
+    case AvatarState::Selected:   return QStringLiteral("selected");
+    case AvatarState::Thinking:   return QStringLiteral("think");
+    case AvatarState::Angry:      return QStringLiteral("angry");
+    case AvatarState::Action:     return QStringLiteral("action");
+    case AvatarState::GoodMove:   return QStringLiteral("good");
+    case AvatarState::UndoAsk:    return QStringLiteral("undo");
+    case AvatarState::Listening:  return QStringLiteral("listen");
+    case AvatarState::Lose:       return QStringLiteral("lose");
+    case AvatarState::Win:        return QStringLiteral("win");
+    }
+    return QStringLiteral("idle");
+}
+
+// 房主：把奶娃状态发给对面（仅联机房主且奶娃已召唤时生效）
+void MainWindow::syncAvatar(const QString &key)
+{
+    if (m_mode == GameMode::Online && m_isHost && m_dragonSummoned && m_net)
+        m_net->sendAvatar(key);
+}
+
+// 加入者：按收到的关键字渲染底部帮手条（与房主端形象状态一一对应）
+void MainWindow::setPeerAvatar(const QString &key)
+{
+    if (!m_peerBar)
+        return;
+    if (m_peerMovie->state() == QMovie::Running)
+        m_peerMovie->stop();
+    if (m_peerMovie2->state() == QMovie::Running)
+        m_peerMovie2->stop();
+
+    // 打人动图状态
+    if (key == QStringLiteral("action") && m_peerMovie->isValid()) {
+        m_peerImg->setMovie(m_peerMovie);
+        m_peerMovie->start();
+        m_peerMood->setText(QStringLiteral("看我反击！"));
+        return;
+    }
+    if (key == QStringLiteral("action2") && m_peerMovie2->isValid()) {
+        m_peerImg->setPixmap(QPixmap());   // 清静态图，交给 frameChanged 回调上屏
+        m_peerMovie2->start();
+        m_peerMood->setText(QStringLiteral("奶娃出拳！砰！"));
+        return;
+    }
+
+    QString file = QStringLiteral("idle.jpg");
+    QString mood = QStringLiteral("我只是一只小奶龙");
+    if (key == QStringLiteral("ready")) {
+        mood = QStringLiteral("奶娃已就位！要我替你下棋不？");
+    } else if (key == QStringLiteral("selected")) {
+        file = QStringLiteral("selected.jpg");  mood = QStringLiteral("绷不住了");
+    } else if (key == QStringLiteral("think")) {
+        file = QStringLiteral("thinking.jpg");  mood = QStringLiteral("思考中…");
+    } else if (key == QStringLiteral("angry")) {
+        file = QStringLiteral("angry.jpg");     mood = QStringLiteral("敢吃我的子？！");
+    } else if (key == QStringLiteral("good")) {
+        file = QStringLiteral("good.jpg");      mood = QStringLiteral("这一步不错！");
+    } else if (key == QStringLiteral("undo")) {
+        file = QStringLiteral("undo.jpg");      mood = QStringLiteral("什么？你要悔棋？！");
+    } else if (key == QStringLiteral("listen")) {
+        file = QStringLiteral("music.jpg");     mood = QStringLiteral("♪ 沉浸音乐中…");
+    } else if (key == QStringLiteral("lose")) {
+        file = QStringLiteral("lose.jpg");      mood = QStringLiteral("呜呜…我输了");
+    } else if (key == QStringLiteral("win")) {
+        file = QStringLiteral("win.jpg");       mood = QStringLiteral("你真是菜坤");
+    }
+    m_peerImg->setPixmap(QPixmap(QStringLiteral(":/avatar/") + file)
+        .scaled(m_peerImg->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    m_peerMood->setText(mood);
+}
+
+// 加入者：收到房主端奶娃状态（首条消息会让帮手条现身）
+void MainWindow::onNetworkAvatar(const QString &key)
+{
+    if (m_mode != GameMode::Online || m_isHost)
+        return;
+    if (m_peerBar)
+        m_peerBar->setVisible(true);
+    setPeerAvatar(key);
+}
+
+// ============================================================================
+// 联机模式：对方掉线
+// ============================================================================
+void MainWindow::onPeerDisconnected()
+{
+    m_gameOver = true;
+    m_afk = false;
+    if (m_afkBtn)
+        m_afkBtn->setText(QStringLiteral("🥱 奶娃挂机"));
+    if (m_peerBar)
+        m_peerBar->setVisible(false);   // 房主端奶娃随连接一起消失
+    if (m_chatView)
+        m_chatView->append(QStringLiteral("<i style='color:#888'>—— 对方已断开连接 ——</i>"));
+    QMessageBox::warning(this,
+        QStringLiteral("连接断开"),
+        QStringLiteral("对方已离开房间，对局结束。"));
+    refreshButtons();
+}
+
+// ============================================================================
+// 联机模式：发送聊天
+// ============================================================================
+void MainWindow::sendChatMessage()
+{
+    if (!m_chatInput || !m_net)
+        return;
+    const QString text = m_chatInput->text().trimmed();
+    if (text.isEmpty())
+        return;
+    m_net->sendChat(text);
+    m_chatView->append(QStringLiteral("<b style='color:#27ae60'>我：</b>") + text.toHtmlEscaped());
+    m_chatInput->clear();
+}
+
+// ============================================================================
+// 联机：版本握手 —— 版本不一致时提示双方更新，防止新旧混用走棋不同步
+// ============================================================================
+void MainWindow::onNetworkVersion(const QString &ver)
+{
+    if (ver == QStringLiteral("3.1.1"))
+        return;
+    if (m_chatView)
+        m_chatView->append(QStringLiteral(
+            "<i style='color:#c0392b'>⚠ 对方版本（%1）与本机（3.1.1）不一致，"
+            "请双方都用最新安装包，否则可能出现走棋不同步</i>").arg(ver.toHtmlEscaped()));
+}
+
+// ============================================================================
+// 联机：收到越界/非法走子（旧版 bug 会发 -1,-1）—— 不执行，聊天区提示
+// ============================================================================
+void MainWindow::onNetworkBadMove()
+{
+    if (m_chatView)
+        m_chatView->append(QStringLiteral(
+            "<i style='color:#c0392b'>⚠ 收到对方发来的非法走子数据，可能是对方版本过旧，请双方都更新到最新版</i>"));
+}
+
+// ============================================================================
+// 联机悔棋：请求方发 UNDO REQ，对方同意后双方各撤销一手（回两手=对方+自己）
+// ============================================================================
+void MainWindow::sendUndoRequest()
+{
+    if (!m_net || m_waitingUndo)
+        return;
+    m_waitingUndo = true;
+    refreshButtons();
+    m_net->sendUndoRequest();
+    statusBar()->showMessage(QStringLiteral("已发送悔棋请求，等待对方同意…"));
+}
+
+void MainWindow::onNetworkUndoRequest()
+{
+    if (m_gameOver || m_aiThinking) {
+        m_net->sendUndoAnswer(false);
+        return;
+    }
+    const auto ret = QMessageBox::question(this,
+        QStringLiteral("悔棋"),
+        QStringLiteral("对方请求悔棋，是否同意？"),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No);
+    m_net->sendUndoAnswer(ret == QMessageBox::Yes);
+    if (ret == QMessageBox::Yes)
+        performOnlineUndo(false);
+}
+
+void MainWindow::onNetworkUndoAnswer(bool accepted)
+{
+    m_waitingUndo = false;
+    refreshButtons();
+    if (accepted) {
+        statusBar()->showMessage(QStringLiteral("对方同意了悔棋"));
+        performOnlineUndo(true);
+    } else {
+        statusBar()->showMessage(QStringLiteral("对方拒绝了悔棋"));
+    }
+}
+
+// 联机悔棋：双方按"请求方颜色"回退——先撤请求方最后一手之后的所有应手，
+// 再撤请求方那手；悔棋后轮到请求方走，两边棋盘保持一致
+void MainWindow::performOnlineUndo(bool requesterIsMe)
+{
+    const bool requesterRed = requesterIsMe ? m_playerRed : !m_playerRed;
+    // 请求方最后一手之后，对方可能已经应手——先全部撤掉
+    while (!m_history.empty() && m_history.back().byRed != requesterRed) {
+        revertStep(m_history.back());
+        m_history.pop_back();
+    }
+    // 再撤请求方要悔的那一手
+    if (!m_history.empty() && m_history.back().byRed == requesterRed) {
+        revertStep(m_history.back());
+        m_history.pop_back();
+    }
+
+    m_gameOver = false;
+    clearSelection();
+    m_avatarTimer->stop();
+    setAvatar(AvatarState::Idle);
+    if (m_history.empty()) {
+        m_hasLast = false;
+        resetGameHash();
+        resetKillerAndHistory();
+    } else {
+        m_last = m_history.back().move;
+        m_hasLast = true;
+    }
+    updateCheckState();
+    refreshButtons();
+    m_view->update();
+
+    // 悔棋后轮到请求方走（回了两手）
+    m_myTurn = requesterIsMe;
+    statusBar()->showMessage(requesterIsMe
+        ? QStringLiteral("悔棋成功，轮到你走")
+        : QStringLiteral("对方悔棋成功，轮到对方走"));
+}
+
+// ============================================================================
+// 联机重新开始：请求方发 AGAIN REQ，对方同意后双方都重开（房主=红方先手）
+// ============================================================================
+void MainWindow::sendRestartRequest()
+{
+    if (!m_net || m_waitingRestart)
+        return;
+    m_waitingRestart = true;
+    refreshButtons();
+    m_net->sendRestartRequest();
+    statusBar()->showMessage(QStringLiteral("已发送重新开始请求，等待对方同意…"));
+}
+
+void MainWindow::onNetworkRestartRequest()
+{
+    const auto ret = QMessageBox::question(this,
+        QStringLiteral("重新开始"),
+        QStringLiteral("对方请求重新开始，是否同意？"),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No);
+    m_net->sendRestartAnswer(ret == QMessageBox::Yes);
+    if (ret == QMessageBox::Yes)
+        applyOnlineRestart();
+}
+
+void MainWindow::onNetworkRestartAnswer(bool accepted)
+{
+    m_waitingRestart = false;
+    refreshButtons();
+    if (accepted) {
+        statusBar()->showMessage(QStringLiteral("对方同意了重新开始"));
+        applyOnlineRestart();
+    } else {
+        statusBar()->showMessage(QStringLiteral("对方拒绝了重新开始"));
+    }
+}
+
+// 联机重开：两边都调用，保证棋盘完全同步重置
+void MainWindow::applyOnlineRestart()
+{
+    initBoard();
+    resetGameHash();
+    resetKillerAndHistory();
+    m_history.clear();
+    clearSelection();
+    m_hasLast = false;
+    m_gameOver = false;
+    m_aiThinking = false;
+    m_animPhase = 0.0;
+    m_wasRedInCheck = false;
+    m_wasBlackInCheck = false;
+    m_avatarTimer->stop();
+    setAvatar(AvatarState::Idle);
+    // 联机：房主=红方先手
+    m_myTurn = m_isHost;
+    updateCheckState();
+    refreshButtons();
+    m_view->update();
+    statusBar()->showMessage(m_isHost
+        ? QStringLiteral("新对局开始：你执红先行")
+        : QStringLiteral("新对局开始：对方执红先行"));
+}
+
+// ============================================================================
+// 联机房主专属：召唤奶龙 → 播放登场动画（跳舞+音乐），之后解锁"奶娃挂机"
+// ============================================================================
+void MainWindow::summonDragon()
+{
+    if (m_mode != GameMode::Online || !m_isHost || m_gameOver
+        || !m_myTurn || m_dragonSummoned)
+        return;
+
+    // 登场视频自带音乐：先暂停背景音乐，播完再恢复
+    ensureMusicPlayer();
+    const bool musicWasPlaying =
+        m_musicPlayer->playbackState() == QMediaPlayer::PlayingState;
+    if (musicWasPlaying)
+        m_musicPlayer->pause();
+
+    DragonVideoDialog dlg(this);
+    dlg.exec();
+
+    if (musicWasPlaying)
+        m_musicPlayer->play();
+
+    // 召唤完成：形象面板现身，召唤钮退场，挂机钮登场
+    m_dragonSummoned = true;
+    m_avatarPanel->setVisible(true);
+    m_summonBtn->setVisible(false);
+    m_afkBtn->setVisible(true);
+    m_avatarMood->setText(QStringLiteral("奶娃已就位！要我替你下棋不？"));
+    syncAvatar(QStringLiteral("ready"));   // 对面屏幕底部出现奶娃帮手条
+    if (m_chatView)
+        m_chatView->append(QStringLiteral("<i style='color:#8e44ad'>🐲 奶龙登场！可开启“奶娃挂机”让它替你出战</i>"));
+    statusBar()->showMessage(QStringLiteral("奶龙已登场，点击“奶娃挂机”开始自动对战"));
+}
+
+// ============================================================================
+// 奶娃挂机：开启后轮到房主时自动想棋、自动落子并把走法发给对方
+// ============================================================================
+void MainWindow::toggleAfk()
+{
+    if (!m_dragonSummoned || m_gameOver)
+        return;
+
+    if (!m_afk) {
+        m_afk = true;
+        m_afkBtn->setText(QStringLiteral("⏹ 停止挂机"));
+        statusBar()->showMessage(QStringLiteral("奶娃开始挂机代打…"));
+        if (m_chatView)
+            m_chatView->append(QStringLiteral("<i style='color:#8e44ad'>🐲 奶娃：交给我，你去歇着！</i>"));
+        startAfkMove();   // 若当前轮到房主，立即出手
+    } else {
+        m_afk = false;
+        m_afkBtn->setText(QStringLiteral("🥱 奶娃挂机"));
+        statusBar()->showMessage(QStringLiteral("已停止挂机，接下来你自己走"));
+        // 正在思考的那一步让它走完（走完不再自动续），思考脸提前收回
+        if (!m_aiThinking && !m_avatarTimer->isActive())
+            setAvatar(AvatarState::Idle);
+    }
+}
+
+// 挂机：奶娃替房主启动后台搜索（执房主方颜色，固定思考 3 秒）
+void MainWindow::startAfkMove()
+{
+    if (!m_afk || m_gameOver || !m_myTurn || m_aiThinking)
+        return;
+
+    m_aiThinking = true;
+    refreshButtons();
+    if (!m_avatarTimer->isActive())
+        setAvatar(AvatarState::Thinking);
+
+    m_aiThread = new AiThread();
+    std::memcpy(m_aiThread->m_board, coreBoard, sizeof(coreBoard));
+    m_aiThread->m_timeMs = 3000;
+    m_aiThread->m_redSide = m_playerRed;   // 替房主（我方）想
+    connect(m_aiThread, &QThread::finished, this, &MainWindow::onAfkFinished);
+    connect(m_aiThread, &QThread::finished, m_aiThread, &QObject::deleteLater);
+
+    m_thinkClock->restart();
+    m_thinkTimer->start();
+    onAiTick();
+    m_aiThread->start();
+}
+
+// 挂机搜索结束：奶娃自动落子 → 随机吃子效果 → 判终局 → 发给对方
+void MainWindow::onAfkFinished()
+{
+    const Move mv = m_aiThread->m_result;
+    m_aiThread = nullptr;
+    m_thinkTimer->stop();
+    m_aiThinking = false;
+
+    // 兜底：我方无棋可走 = 我方输
+    if (!(inBoard(mv.x1, mv.y1) && inBoard(mv.x2, mv.y2))) {
+        m_gameOver = true;
+        m_animTimer->stop();
+        statusBar()->showMessage(QStringLiteral("你方无棋可走，对方胜利"));
+        setAvatar(AvatarState::Win);
+        m_sndLose->play();
+        m_view->update();
+        QMessageBox::information(this,
+            QStringLiteral("对局结束"),
+            QStringLiteral("对方胜利！\n你方无子可动（困毙）"));
+        refreshButtons();
+        return;
+    }
+
+    // ---- 奶娃落子，记入历史 ----
+    Step s;
+    s.captured = coreBoard[mv.x2][mv.y2];
+    s.piece = coreBoard[mv.x1][mv.y1];
+    executeMove(mv);
+    s.move = mv;
+    s.byRed = m_playerRed;
+    m_history.push_back(s);
+    m_last = mv;
+    m_hasLast = true;
+
+    // ---- 奶娃吃子：音效和打人动画各自随机二选一 ----
+    if (s.captured != 0) {
+        const bool newSfx = QRandomGenerator::global()->bounded(2) == 0;
+        (newSfx ? m_sndCapture2 : m_sndCapture)->play();
+        playAfkCaptureAction(QRandomGenerator::global()->bounded(2) == 0);
+    } else {
+        // 非吃子：奶龙保持平时动作，收回思考脸
+        m_sndMove->play();
+        setAvatar(AvatarState::Idle);
+    }
+    clearSelection();
+
+    // ---- 判对面终局 ----
+    const int oppState = checkGameOver(coreBoard, !m_playerRed);
+    if (oppState != 0)
+        m_gameOver = true;
+    updateCheckState();
+    m_view->update();
+
+    // ---- 走法必须在弹任何终局对话框之前发出：模态对话框会阻塞事件循环，
+    // 若先弹窗，对方要等到本方点掉弹窗才能收到这步（看着就像"卡死在将军一步"）----
+    m_myTurn = false;
+    if (m_net)
+        m_net->sendMove(mv.x1, mv.y1, mv.x2, mv.y2);
+
+    if (oppState != 0) {
+        const QString kill = QString::fromLocal8Bit(
+            getKillTypeName(coreBoard, !m_playerRed).c_str());
+        const QString reason = (oppState == 1)
+            ? QStringLiteral("对面被将死")
+            : QStringLiteral("对面无子可动（困毙）");
+        statusBar()->showMessage(QStringLiteral("奶娃帮你赢了！") + reason);
+        m_animTimer->stop();
+        m_avatarTimer->stop();
+        setAvatar(AvatarState::Lose);
+        m_sndWin->play();
+        m_view->update();
+        if (m_chatView)
+            m_chatView->append(QStringLiteral("<i style='color:#8e44ad'>🐲 奶娃：轻轻松松，带你吃鸡！</i>"));
+        QMessageBox::information(this,
+            QStringLiteral("对局结束"),
+            QStringLiteral("🎉 奶娃代打胜利！\n%1\n杀法：%2").arg(reason, kill));
+    } else {
+        // 对方走后 onNetworkMoveReceived 会再触发奶娃
+        statusBar()->showMessage(QStringLiteral("奶娃已走子，等待对方…"));
+    }
+    refreshButtons();
+}
+
+// 奶娃吃子后的打人动作：新版出拳 gif / 原版打人 gif 随机
+void MainWindow::playAfkCaptureAction(bool useNewGif)
+{
+    m_avatarTimer->stop();
+    m_avatarState = AvatarState::Action;
+    syncAvatar(useNewGif ? QStringLiteral("action2") : QStringLiteral("action"));
+
+    if (useNewGif && m_avatarMovie2->isValid()) {
+        if (m_avatarMovie->state() == QMovie::Running)
+            m_avatarMovie->stop();
+        m_avatarMood->setText(QStringLiteral("奶娃出拳！砰！"));
+        m_avatarMovie2->start();   // frameChanged 回调负责缩放上屏
+        m_avatarTimer->start(2400);
+    } else {
+        if (m_avatarMovie2->state() == QMovie::Running)
+            m_avatarMovie2->stop();
+        m_avatarMood->setText(QStringLiteral("看我反击！"));
+        m_avatarImg->setMovie(m_avatarMovie);
+        m_avatarMovie->start();
+        m_avatarTimer->start(1300);
+    }
+}
+
